@@ -2,8 +2,13 @@
 # rcache benchmark: a slow origin (a file on a slow filesystem, loop-mounted)
 # versus the same origin behind rcache with the journal on fast storage.
 #
-# This measures the configuration rcache exists for: random writes that a
-# spinning disk (or a slow network filesystem) handles badly.
+# Three configurations are compared against the same origin:
+#   1. the origin directly (no cache),
+#   2. the origin through rcache,
+#   3. the origin through the kernel's dm-writecache (when available).
+#
+# dm-writecache is the reference implementation of the same idea; beating the
+# direct write is not enough, the point is to be competitive with it.
 #
 # Usage:
 #   sudo bench/bench.sh [--slow-dir /mnt/mergerfs/rcache-bench] \
@@ -73,6 +78,9 @@ LOOP=""
 MOUNT=""
 RCACHE_PID=""
 DEVICE=""
+DM_NAME=""
+DM_CACHE_LOOP=""
+DM_PID=""
 
 cleanup() {
     set +e
@@ -94,6 +102,11 @@ cleanup() {
         kill -9 "$RCACHE_PID" 2>/dev/null
         wait "$RCACHE_PID" 2>/dev/null
     fi
+    if [ -n "$DM_NAME" ]; then
+        umount "$MOUNT" 2>/dev/null
+        dmsetup remove "$DM_NAME" 2>/dev/null
+    fi
+    [ -n "$DM_CACHE_LOOP" ] && losetup -d "$DM_CACHE_LOOP" 2>/dev/null
     [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
     rm -rf "${MOUNT:-}" 2>/dev/null
     rm -f "$ORIGIN_IMG" "$JOURNAL_FILE"
@@ -283,6 +296,54 @@ else
     SPEEDUP="n/a"
 fi
 
+# ---------------------------------------------------------------- dm-writecache
+# Optional third configuration: the kernel's own write cache, same origin and
+# same fast backing file. This is the reference rcache is trying to beat.
+DM_METRICS=""
+if [ "${WITH_DM_WRITECACHE:-1}" = "1" ] && command -v dmsetup >/dev/null 2>&1 \
+   && modprobe dm-writecache 2>/dev/null && dmsetup targets 2>/dev/null | grep -q '^writecache'; then
+    echo
+    echo "================ with dm-writecache ================"
+    # The mapped device is torn down; rebuild a fresh origin for a fair run.
+    [ -n "$MOUNT" ] && { umount "$MOUNT" 2>/dev/null; MOUNT=""; }
+    if [ -n "$DEVICE" ]; then "$RCACHE" stop --id "$DEVICE" >/dev/null 2>&1; DEVICE=""; fi
+    kill "$RCACHE_PID" 2>/dev/null; wait "$RCACHE_PID" 2>/dev/null; RCACHE_PID=""
+    losetup -d "$LOOP" 2>/dev/null
+    rm -f "$ORIGIN_IMG"; truncate -s "$SIZE" "$ORIGIN_IMG"
+    LOOP=$(losetup --find --show "$ORIGIN_IMG") || die "losetup failed"
+
+    DM_CACHE_IMG="$FAST_DIR/dm-cache.img"
+    rm -f "$DM_CACHE_IMG"
+    if fallocate -l "$JOURNAL" "$DM_CACHE_IMG" 2>/dev/null; then
+        DM_CACHE_LOOP=$(losetup --find --show "$DM_CACHE_IMG")
+        # The first sector must be zero before dm-writecache initialises it.
+        dd if=/dev/zero of="$DM_CACHE_LOOP" bs=512 count=1 conv=notrunc status=none 2>/dev/null
+        DM_SECTORS=$(blockdev --getsz "$LOOP")
+        DM_NAME="rcache-bench-wc"
+        if dmsetup create "$DM_NAME" \
+             --table "0 $DM_SECTORS writecache s $LOOP $DM_CACHE_LOOP 4096 0" 2>/dev/null; then
+            MOUNT=$(mktemp -d /tmp/rcache-dm.XXXXXX)
+            if mkfs.ext4 -q -F "/dev/mapper/$DM_NAME" 2>/dev/null && mount "/dev/mapper/$DM_NAME" "$MOUNT"; then
+                DMF=$(run_fio randwrite "$MOUNT/fio.bin" --rw=randwrite --size="$FILE_SIZE")
+                if [ -n "$DMF" ]; then
+                    DM_METRICS=$(printf '%s' "$DMF" | extract)
+                    echo "random $BLOCK_SIZE write: IOPS=$(echo "$DM_METRICS" | cut -d' ' -f1) BW=$(echo "$DM_METRICS" | cut -d' ' -f2) MiB/s p99=$(echo "$DM_METRICS" | cut -d' ' -f3) us"
+                else
+                    log "warning: dm-writecache fio produced no output"
+                fi
+            else
+                log "warning: could not put a filesystem on /dev/mapper/$DM_NAME"
+            fi
+        else
+            log "warning: dmsetup create failed for dm-writecache (skipping)"
+        fi
+    else
+        log "warning: cannot allocate $JOURNAL for the dm-writecache device (skipping)"
+    fi
+else
+    log "dm-writecache unavailable, skipping that comparison"
+fi
+
 echo
 echo "================ summary ================"
 printf '%-28s %10s %12s %10s\n' "configuration" "IOPS" "MiB/s" "p99 us"
@@ -294,6 +355,12 @@ printf '%-28s %10s %12s %10s\n' "origin + rcache" \
     "$(echo "$CACHED_METRICS" | cut -d' ' -f1)" \
     "$(echo "$CACHED_METRICS" | cut -d' ' -f2)" \
     "$(echo "$CACHED_METRICS" | cut -d' ' -f3)"
+if [ -n "$DM_METRICS" ]; then
+    printf '%-28s %10s %12s %10s\n' "origin + dm-writecache" \
+        "$(echo "$DM_METRICS" | cut -d' ' -f1)" \
+        "$(echo "$DM_METRICS" | cut -d' ' -f2)" \
+        "$(echo "$DM_METRICS" | cut -d' ' -f3)"
+fi
 printf '%-28s %10s\n' "speed-up (IOPS)" "$SPEEDUP"
 
 if [ -n "$JSON" ]; then

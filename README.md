@@ -339,17 +339,24 @@ sudo bench/bench.sh --size 1G --journal 256M --runtime 20 --json out.json
 在快盘上放日志，然后对比"直写 origin"与"经 rcache"。它自己管理 loop 设备、
 挂载点和 rcache 进程，结束后清理。
 
-### 实测结果
+### 实测结果（三方对比）
 
-在 `192.168.0.220` 上测（origin = NFS 上的 loop 文件，日志在本地 NVMe，
-`mkfs.ext4` + 4 KiB 随机写 20 秒）：
+在 `192.168.0.220` 上测：origin 是 NFS（真实 HDD 存储）上的 loop 文件，
+缓存放本地 NVMe，`mkfs.ext4` 后做 4 KiB 随机写 20 秒。
 
-| 配置 | IOPS | 带宽 | p99 |
+| 配置 | IOPS | 带宽 | p99 延迟 |
 |---|---|---|---|
-| 直写 origin（loop + ext4，无 rcache） | ~13000 | ~51 MiB/s | 189 µs |
-| 经 rcache | ~4000 | ~16 MiB/s | 3.8 ms |
+| 直写 origin（loop + ext4） | 9219 | 36.0 MiB/s | 189 µs |
+| 经 rcache | 4055 | 15.8 MiB/s | 2966 µs |
+| **dm-writecache（内核实现）** | **12896** | **50.4 MiB/s** | **144 µs** |
 
-**在这台机器上 rcache 仍是负优化（约 0.3×）**，但原因已经查清，见下。
+**结论：rcache 在这台机器上比直写慢，更远不如 dm-writecache。**
+
+- rcache = 直写的 **0.4×**
+- rcache ≈ dm-writecache 的 **1/3**
+
+`dm-writecache` 不仅比直写快（1.4×），p99 延迟还更低——它把写在 SSD 上聚合并
+异步回写，同时靠内核的多队列并发处理请求。这正是 rcache 缺乏的能力。
 
 ### 排查过程中发现的一个严重 bug
 
@@ -373,11 +380,15 @@ sudo bench/bench.sh --size 1G --journal 256M --runtime 20 --json out.json
 不是测量问题，是**反复受环境状态（ublk 泄漏、磁盘满）干扰的测量**恰好落在
 bug 表现的不同区间。
 
-### 为什么在 NFS 上还是打不过直写
+### 为什么打不过直写和 dm-writecache
 
-直写时，内核 NFS 客户端可以并行提交**几十个 RPC**；rcache 把所有队列线程
-串行在**一把全局 `cache` 锁**上（写日志、回写、FLUSH 都要拿它）。
-NFS 慢在单次 RPC 延迟而非并发能力，所以这把锁在这里是纯损耗。
+**全局锁**。直写时内核 NFS 客户端可以并行提交几十个 RPC，`dm-writecache`
+也利用多队列并发；rcache 把所有队列线程串行在**一把全局 `cache` 锁**上
+（写日志、回写、FLUSH 都要拿它）。NFS 慢在单次 RPC 延迟而非并发能力，
+所以这把锁在这里是纯损耗。
+
+统计里 `flush` 的 p99 达到 **10 秒**，`write-back` 的 p99 同样在 10 秒量级——
+说明偶尔有某个操作长时间占着这把锁，把整个队列都堵住了。
 
 其它已修复的、同样会拖慢写路径的问题：
 

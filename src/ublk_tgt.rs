@@ -234,6 +234,42 @@ impl Target {
     /// Create the device and serve requests until it is stopped or `stop()`
     /// is triggered by a signal.
     pub fn run(self, drain: Arc<AtomicBool>, metrics_listen: Option<String>) -> Result<()> {
+        // A ublk id can be held by the kernel after a crashed process, in
+        // which case creation fails with EOPNOTSUPP. Retry once with the next
+        // free id instead of leaving the operator to clean up by hand.
+        let mut target = self;
+        let first_id = resolve_id(target.id)?;
+        target.id = first_id;
+
+        // Keep a copy of what a retry needs before `run_once` consumes the
+        // target, so a stale id does not force the operator to intervene.
+        let retry_spec = (
+            target.cache.clone(),
+            target.origin.clone(),
+            target.queues,
+            target.depth,
+            target.write_back,
+        );
+        match target.run_once(drain, metrics_listen) {
+            Err(e) if is_stale_id_error(&e) => {
+                log::warn!("device id {first_id} is unusable ({e:#}); retrying with another id");
+                let next = next_free_id_excluding(first_id)?;
+                log::info!("retrying with device id {next}");
+                Target {
+                    id: next,
+                    cache: retry_spec.0,
+                    origin: retry_spec.1,
+                    queues: retry_spec.2,
+                    depth: retry_spec.3,
+                    write_back: retry_spec.4,
+                }
+                .run_once(Arc::new(AtomicBool::new(false)), None)
+            }
+            other => other,
+        }
+    }
+
+    fn run_once(self, drain: Arc<AtomicBool>, metrics_listen: Option<String>) -> Result<()> {
         let cache = open_cache(&self.cache, &self.origin)?;
         let dev_size = cache.log.hdr.origin_size;
         log::info!(
@@ -768,6 +804,42 @@ fn byte_range(byte_off: u64, bytes: usize) -> (u64, usize) {
     let first = byte_off / BLOCK;
     let last = byte_off.saturating_add(bytes as u64).div_ceil(BLOCK);
     (first, (last - first) as usize)
+}
+
+/// Turn a negative id into a free one.
+fn resolve_id(id: i32) -> Result<i32> {
+    if id < 0 {
+        next_free_id()
+    } else {
+        Ok(id)
+    }
+}
+
+/// ublk reports a stale id as `EOPNOTSUPP`; our error carries the message.
+fn is_stale_id_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    s.contains("failed to create ublk device") && (s.contains("-95") || s.contains("EOPNOTSUPP"))
+}
+
+/// Next free id, pretending `used` is taken (used when a retry is needed).
+fn next_free_id_excluding(used: i32) -> Result<i32> {
+    let mut used_set: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    used_set.insert(used);
+    if let Ok(rd) = std::fs::read_dir("/sys/class/ublk-char") {
+        for e in rd.flatten() {
+            if let Some(n) = e
+                .file_name()
+                .to_str()
+                .and_then(|s| s.strip_prefix("ublkc"))
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                used_set.insert(n);
+            }
+        }
+    }
+    (0..1024)
+        .find(|id| !used_set.contains(id))
+        .context("no free ublk id")
 }
 
 /// Allocate the lowest unused ublk device id.

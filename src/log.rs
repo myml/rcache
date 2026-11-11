@@ -239,6 +239,10 @@ impl Log {
         self.header_dirty = true;
         self.file.sync_data()?;
         self.header_dirty = false;
+        // Everything appended so far is now durable, so the batch counter
+        // starts again. Without this the counter stays above the threshold
+        // and *every* subsequent append pays for a full fsync.
+        self.appended_since_sync = 0;
         Ok(())
     }
 

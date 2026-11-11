@@ -875,6 +875,45 @@ mod tests {
         assert!(read_origin(&fx, 0).iter().all(|&b| b == 0x77));
     }
 
+    /// Regression: once the append batch counter reaches BATCH_APPENDS and a
+    /// sync happens, the counter must start again. If it is not reset, every
+    /// later append pays for a full fsync -- which on a slow origin turns a
+    /// cache that should absorb writes into a synchronous passthrough.
+    #[test]
+    fn sync_resets_the_batch_counter() {
+        let fx = Fx::new("batchreset");
+        let mut c = Cache::open(&fx.cache, &fx.origin).unwrap();
+        let batch = crate::log::BATCH_APPENDS as usize;
+
+        // Drive past the first batch boundary so a sync is triggered.
+        for i in 0..batch + 1 {
+            c.write_block(i as u64, &[0x11; BLOCK as usize]).unwrap();
+            c.publish().unwrap();
+        }
+        assert!(
+            c.pending_appends() < crate::log::BATCH_APPENDS,
+            "counter not reset after a sync: {} pending",
+            c.pending_appends()
+        );
+
+        // Appends after the reset must accumulate again. If the counter had
+        // stayed above the threshold, each of these would sync immediately and
+        // pending_appends() would remain 0.
+        c.write_block(999, &[0x22; BLOCK as usize]).unwrap();
+        let after_one = c.pending_appends();
+        assert!(
+            (1..crate::log::BATCH_APPENDS).contains(&after_one),
+            "counter did not restart: {after_one} pending, an fsync runs per append"
+        );
+        c.write_block(998, &[0x33; BLOCK as usize]).unwrap();
+        assert!(
+            c.pending_appends() > after_one,
+            "counter is not accumulating ({} -> {})",
+            after_one,
+            c.pending_appends()
+        );
+    }
+
     /// A step given an already-expired deadline must do nothing, and a
     /// partial step must only reclaim what it actually wrote back.
     #[test]

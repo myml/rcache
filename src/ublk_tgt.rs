@@ -64,8 +64,7 @@ struct Shared {
 }
 
 fn usage_pct(c: &Cache) -> u64 {
-    let len = c.log.hdr.log_len.max(1);
-    c.log.used().saturating_mul(100) / len
+    c.used_pct()
 }
 
 impl Shared {
@@ -158,7 +157,9 @@ fn spawn_write_back(
             }
             let res = {
                 let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());
-                c.write_back_step(wb.step_blocks)
+                // Durability before reclaiming: the records we are about to
+                // write back must not be forgotten from the journal first.
+                c.sync().and_then(|()| c.write_back_step(wb.step_blocks))
             };
             match res {
                 Ok(0) => {
@@ -336,6 +337,9 @@ impl Target {
         // Stop the background writer, then do the final drain.
         writer.stop();
         let mut c = shared.lock();
+        if c.pending_appends() > 0 {
+            log::debug!("{} appends pending at shutdown, syncing", c.pending_appends());
+        }
         c.flush().context("final journal drain failed")?;
         log::info!("rcache: stopped, journal drained");
         Ok(())
@@ -482,13 +486,18 @@ pub fn process_op_shared(
                 }
             }
         }
-        libublk::sys::UBLK_IO_OP_FLUSH => match lock().flush() {
-            Ok(()) => 0,
-            Err(e) => {
-                log::error!("flush: {e}");
-                -libc::EIO
+        libublk::sys::UBLK_IO_OP_FLUSH => {
+            // Everything accepted so far must be on stable storage before the
+            // flush reports success.
+            let mut c = lock();
+            match c.sync().and_then(|()| c.flush()) {
+                Ok(()) => 0,
+                Err(e) => {
+                    log::error!("flush: {e}");
+                    -libc::EIO
+                }
             }
-        },
+        }
         libublk::sys::UBLK_IO_OP_DISCARD => match lock().discard(blk, nblocks) {
             Ok(()) => 0,
             Err(e) => {

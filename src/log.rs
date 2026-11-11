@@ -30,6 +30,10 @@ fn round_up(v: u64, unit: u64) -> u64 {
     v.div_ceil(unit) * unit
 }
 
+/// Appends per durable header update. Larger batches mean fewer fsyncs but
+/// more writes that can be lost if the machine loses power.
+pub const BATCH_APPENDS: u32 = 64;
+
 /// Smallest cache file we will accept (1 MiB, block aligned).
 pub const MIN_CACHE_SIZE: u64 = 1024 * 1024;
 
@@ -135,6 +139,10 @@ impl Header {
 pub struct Log {
     file: File,
     pub hdr: Header,
+    /// Header bytes are on disk but not yet fsynced.
+    header_dirty: bool,
+    /// Appends since the last fsync of the header/data.
+    appended_since_sync: u32,
     /// Name tag of the origin device, only for diagnostics.
     #[allow(dead_code)]
     pub origin: String,
@@ -185,6 +193,8 @@ impl Log {
                     file,
                     hdr,
                     origin: origin.to_string(),
+                    header_dirty: false,
+                    appended_since_sync: 0,
                 });
             }
             if size < MIN_CACHE_SIZE {
@@ -212,16 +222,58 @@ impl Log {
             file,
             hdr,
             origin: origin.to_string(),
+            header_dirty: false,
+            appended_since_sync: 0,
         };
         log.sync_header()?;
         Ok(log)
     }
 
+    /// Persist the header. `durable = false` only writes the sector (the OS
+    /// may still cache it); `flush_header()` makes it durable later.
     fn sync_header(&mut self) -> anyhow::Result<()> {
         let b = self.hdr.encode();
         self.file.write_all_at(&b, 0)?;
+        self.header_dirty = true;
         self.file.sync_data()?;
+        self.header_dirty = false;
         Ok(())
+    }
+
+    /// Write the header without forcing it to disk.
+    fn write_header(&mut self) -> anyhow::Result<()> {
+        let b = self.hdr.encode();
+        self.file.write_all_at(&b, 0)?;
+        self.header_dirty = true;
+        Ok(())
+    }
+
+    /// Force everything written so far (records + header) to stable storage.
+    ///
+    /// Calls are cheap when nothing changed.
+    pub fn flush_header(&mut self) -> anyhow::Result<()> {
+        if !self.header_dirty && self.appended_since_sync == 0 {
+            return Ok(());
+        }
+        self.file.sync_data()?;
+        self.header_dirty = false;
+        self.appended_since_sync = 0;
+        Ok(())
+    }
+
+    /// Publish the in-memory head/tail/version so a reader (and a crash
+    /// replay) sees the records appended since the last header write.
+    /// Cheap enough to call once per command.
+    pub fn deferred_header_write(&mut self) -> anyhow::Result<()> {
+        if self.header_dirty {
+            self.write_header()?;
+        }
+        Ok(())
+    }
+
+    /// Number of appends since the last durable sync.
+    pub fn pending_appends(&self) -> u32 {
+        self.appended_since_sync
     }
 
     pub fn used(&self) -> u64 {
@@ -271,7 +323,20 @@ impl Log {
         self.file.write_all_at(&rec, self.hdr.log_off + pos)?;
         self.hdr.tail = (pos + rec.len() as u64) % self.hdr.log_len;
         self.hdr.next_version += 1;
-        self.sync_header()?;
+        self.appended_since_sync += 1;
+
+        // Batch the durability cost. The record is already in the page cache,
+        // so a reader (including our own read path) sees it immediately; an
+        // fsync is only needed before we may *forget* it -- i.e. before a
+        // write-back or a flush reports success. Dropping the last batch on
+        // a hard power loss costs at most `BATCH_APPENDS` recent writes.
+        if self.appended_since_sync >= BATCH_APPENDS {
+            self.sync_header()?;
+        } else {
+            // The header update is deferred to `deferred_header_write()` so a
+            // batch of appends costs one small write, not one per block.
+            self.header_dirty = true;
+        }
         Ok((version, pos))
     }
 
@@ -359,11 +424,16 @@ impl Log {
         // the tail while a writer may be mid-append; `used()` is already 0
         // when head == tail, so no rewind is needed. `reset()` handles the
         // rewind for a full flush.
+        //
+        // No fsync here: the records were already written to the origin, so a
+        // lost head update only means they get replayed again on the next
+        // start -- idempotent, just extra IO.
         self.hdr.head = pos;
-        self.sync_header()
+        self.write_header()
     }
 
-    /// Reset the ring after a complete write-back.
+    /// Reset the ring after a complete write-back. This discards journal
+    /// contents, so it must be durable before new records overwrite them.
     pub fn reset(&mut self) -> anyhow::Result<()> {
         self.hdr.head = 0;
         self.hdr.tail = 0;

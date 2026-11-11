@@ -109,6 +109,19 @@ impl Cache {
         Ok(())
     }
 
+    /// Publish the journal header after a batch of appends.
+    pub fn publish(&mut self) -> anyhow::Result<()> {
+        self.log.deferred_header_write()
+    }
+
+    /// Make every accepted write durable in the journal.
+    ///
+    /// Appends only fsync occasionally, so a FLUSH must force the pending
+    /// batch out before it can claim the data is safe.
+    pub fn sync(&mut self) -> anyhow::Result<()> {
+        self.log.flush_header()
+    }
+
     pub fn index_len(&self) -> usize {
         self.index.len()
     }
@@ -156,9 +169,10 @@ impl Cache {
         }
         for i in 0..blocks {
             let off = i * BLOCK as usize;
-            self.write_block(blk + i as u64, &buf[off..off + BLOCK as usize])?;
+            self.append_block(blk + i as u64, &buf[off..off + BLOCK as usize])?;
         }
-        Ok(())
+        // One header write per command instead of one per block.
+        self.publish()
     }
 
     /// Forward a discard to the origin and drop any journal copy of the range.
@@ -190,8 +204,17 @@ impl Cache {
         Ok(())
     }
 
-    /// Write `buf` (BLOCK bytes) as the new version of `blk`, into the journal.
+    /// Write `buf` (BLOCK bytes) as the new version of `blk`, into the journal
+    /// and publish it. Use the batch entry points for multi-block IO.
+    #[cfg(test)]
     pub fn write_block(&mut self, blk: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.append_block(blk, buf)?;
+        self.log.deferred_header_write()
+    }
+
+    /// Append one block without publishing the header; the caller is expected
+    /// to call `publish()` once its batch is done.
+    fn append_block(&mut self, blk: u64, buf: &[u8]) -> anyhow::Result<()> {
         // Reclaim as needed until the record fits. The background writer keeps
         // the ring low in normal operation, so this rarely runs. When it does,
         // drain fully: partial reclaims can leave the ring unable to fit a
@@ -232,6 +255,17 @@ impl Cache {
         self.log.reset()?;
         self.index.clear();
         Ok(())
+    }
+
+    /// Appends waiting for a durable header update.
+    pub fn pending_appends(&self) -> u32 {
+        self.log.pending_appends()
+    }
+
+    /// Journal usage as a percentage of the ring, for watermarks.
+    pub fn used_pct(&self) -> u64 {
+        let len = self.log.hdr.log_len.max(1);
+        self.log.used().saturating_mul(100) / len
     }
 
     /// Write back at most `budget` blocks (or `max_records` records) from the
@@ -696,6 +730,54 @@ mod tests {
                 100 + i
             );
         }
+    }
+
+    /// Appends are batched for durability, but a record must still be
+    /// replayable (and visible to the index) before its batch is fsynced.
+    #[test]
+    fn batched_appends_are_still_replayable() {
+        let fx = Fx::new("batch");
+        let mut c = Cache::open(&fx.cache, &fx.origin).unwrap();
+        // Fewer than BATCH_APPENDS so nothing is fsynced yet.
+        let n = (crate::log::BATCH_APPENDS as usize) - 1;
+        for i in 0..n {
+            c.write_block(i as u64, &[(i as u8) | 1; BLOCK as usize]).unwrap();
+        }
+        assert!(c.pending_appends() > 0, "expected an unsynced batch");
+        assert_eq!(c.index_len(), n);
+
+        // A reader must see them immediately, from the journal.
+        let mut buf = vec![0u8; BLOCK as usize];
+        c.read_block(0, &mut buf).unwrap();
+        assert_eq!(buf[0], 1);
+
+        // Reopening without an explicit sync must replay them all: the record
+        // bytes are in the page cache and the header records the tail.
+        drop(c);
+        let c2 = Cache::open(&fx.cache, &fx.origin).unwrap();
+        assert_eq!(c2.index_len(), 0, "replay should have drained to origin");
+        for i in 0..n {
+            assert_eq!(read_origin(&fx, i as u64)[0], (i as u8) | 1, "block {i}");
+        }
+    }
+
+    /// `sync()` makes the pending batch durable and is idempotent.
+    #[test]
+    fn sync_makes_batch_durable() {
+        let fx = Fx::new("sync");
+        let mut c = Cache::open(&fx.cache, &fx.origin).unwrap();
+        for i in 0..3u64 {
+            c.write_block(i, &[0x77; BLOCK as usize]).unwrap();
+        }
+        assert!(c.pending_appends() > 0);
+        c.sync().unwrap();
+        assert_eq!(c.pending_appends(), 0);
+        // Syncing again is a no-op, not an error.
+        c.sync().unwrap();
+        // Data lands on the origin only after a write-back.
+        assert!(read_origin(&fx, 0).iter().all(|&b| b == 0));
+        c.flush().unwrap();
+        assert!(read_origin(&fx, 0).iter().all(|&b| b == 0x77));
     }
 
     #[test]

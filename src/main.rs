@@ -20,6 +20,7 @@ fn usage() -> ! {
     eprintln!(
         "usage:
   rcache run    --origin <BLOCKDEV> --cache <FILE> [--id N] [--queues N] [--depth N]
+                [--wb-high PCT] [--wb-low PCT] [--wb-step BLOCKS] [--wb-idle SECS]
   rcache stop   --id N
   rcache status --id N"
     );
@@ -66,6 +67,25 @@ fn real_main() -> Result<()> {
                 .unwrap_or_else(|| "64".into())
                 .parse()?;
 
+            let mut write_back = ublk_tgt::WriteBack::default();
+            if let Some(v) = arg(&args, "--wb-high") {
+                write_back.high_watermark = v.parse().context("--wb-high must be a percentage")?;
+            }
+            if let Some(v) = arg(&args, "--wb-low") {
+                write_back.low_watermark = v.parse().context("--wb-low must be a percentage")?;
+            }
+            if let Some(v) = arg(&args, "--wb-step") {
+                write_back.step_blocks = v.parse().context("--wb-step must be a block count")?;
+            }
+            if let Some(v) = arg(&args, "--wb-idle") {
+                write_back.idle = std::time::Duration::from_secs(
+                    v.parse().context("--wb-idle must be seconds")?,
+                );
+            }
+            if write_back.low_watermark >= write_back.high_watermark {
+                anyhow::bail!("--wb-low must be below --wb-high");
+            }
+
             // Mask the shutdown signals *before* spawning any thread, so every
             // thread inherits the mask and only our sigwait thread consumes
             // them (otherwise the default action kills us mid-flight).
@@ -102,6 +122,7 @@ fn real_main() -> Result<()> {
                 origin,
                 queues,
                 depth,
+                write_back,
             }
             .run(drain)
         }

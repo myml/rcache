@@ -172,6 +172,15 @@ impl Log {
                 if size < hdr.log_off + hdr.log_len {
                     anyhow::bail!("cache file too small for its own journal layout");
                 }
+                // Pointer sanity: an out-of-range or inverted head/tail means
+                // the ring was written by a buggy run (or is corrupt). Refuse
+                // rather than serve wrong data from it.
+                if hdr.head >= hdr.log_len || hdr.tail >= hdr.log_len {
+                    anyhow::bail!(
+                        "journal pointers out of range (head {} tail {} ring {})",
+                        hdr.head, hdr.tail, hdr.log_len
+                    );
+                }
                 return Ok(Log {
                     file,
                     hdr,
@@ -225,8 +234,8 @@ impl Log {
         need + self.used() <= self.hdr.log_len
     }
 
-    /// Append one record and return the version assigned to it.
-    pub fn append(&mut self, blk: u64, data: &[u8]) -> anyhow::Result<u32> {
+    /// Append one record and return its version and ring offset.
+    pub fn append(&mut self, blk: u64, data: &[u8]) -> anyhow::Result<(u32, u64)> {
         let padded = round_up(data.len() as u64, SECTOR);
         if !self.can_fit(data.len() as u64) {
             anyhow::bail!("journal full (used {} of {} ring)", self.used(), self.hdr.log_len);
@@ -245,13 +254,25 @@ impl Log {
         rec[..REC_HDR].copy_from_slice(&h);
         rec[REC_HDR..REC_HDR + data.len()].copy_from_slice(data);
 
-        // Commit the header first: a torn record is simply not visible.
-        self.file.write_all_at(&rec, self.hdr.log_off + self.hdr.tail)?;
-        // Temporary self-check; the header write below is the real commit.
-        self.hdr.tail = (self.hdr.tail + rec.len() as u64) % self.hdr.log_len;
+        // A record must live entirely inside the ring: if it would wrap past
+        // the end, skip the tail forward to the start instead. `scan()` stops
+        // at a record that crosses the end, so wrapping the bytes themselves
+        // would lose the record.
+        let mut pos = self.hdr.tail;
+        if pos + rec.len() as u64 > self.hdr.log_len {
+            let gap = self.hdr.log_len - pos;
+            if self.used() + gap + rec.len() as u64 > self.hdr.log_len {
+                anyhow::bail!("journal full (no room after ring wrap)");
+            }
+            pos = 0;
+            self.hdr.tail = 0;
+            self.hdr.head = 0;
+        }
+        self.file.write_all_at(&rec, self.hdr.log_off + pos)?;
+        self.hdr.tail = (pos + rec.len() as u64) % self.hdr.log_len;
         self.hdr.next_version += 1;
         self.sync_header()?;
-        Ok(version)
+        Ok((version, pos))
     }
 
     /// Read the payload of a record found at `pos` (0 <= pos < log_len).
@@ -293,6 +314,53 @@ impl Log {
             pos = (pos + total) % self.hdr.log_len;
         }
         Ok(out)
+    }
+
+    /// Reclaim records at the front of the ring: the head advances to `pos`,
+    /// which must be a record boundary that `scan()` reported.
+    ///
+    /// The records being reclaimed must already have been written to the
+    /// origin; after this returns the ring may overwrite them.
+    /// Reclaim the first `n_records` records of the ring (as reported by
+    /// `scan()`), advancing the head past exactly their bytes.
+    ///
+    /// Walking the records here rather than trusting a caller-computed offset
+    /// keeps `(tail - head) mod log_len` equal to the real live byte count,
+    /// which is what `used()` and `can_fit()` rely on.
+    pub fn reclaim_records(&mut self, n_records: usize) -> anyhow::Result<()> {
+        if n_records == 0 {
+            return Ok(());
+        }
+        // Snapshot the live length first: `used()` changes as we advance the
+        // head, and using it as the loop bound lets the walk run past the tail.
+        let live = self.used();
+        let mut pos = self.hdr.head;
+        let mut walked = 0u64;
+        let mut taken = 0usize;
+        while taken < n_records && walked < live {
+            let mut h = [0u8; REC_HDR];
+            self.file.read_exact_at(&mut h, self.hdr.log_off + pos)?;
+            let hdr = RecHdr::decode(&h);
+            if hdr.len == 0 || hdr.flags != 1 {
+                break;
+            }
+            let total = hdr.total_len();
+            if walked + total > live {
+                break;
+            }
+            pos = (pos + total) % self.hdr.log_len;
+            walked += total;
+            taken += 1;
+        }
+        if taken == 0 {
+            return Ok(());
+        }
+        // Advance the head only. Rewinding the ring on "now empty" would move
+        // the tail while a writer may be mid-append; `used()` is already 0
+        // when head == tail, so no rewind is needed. `reset()` handles the
+        // rewind for a full flush.
+        self.hdr.head = pos;
+        self.sync_header()
     }
 
     /// Reset the ring after a complete write-back.

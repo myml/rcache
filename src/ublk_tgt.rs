@@ -25,9 +25,47 @@ use std::thread;
 use crate::cache::Cache;
 use crate::log::BLOCK;
 
+/// How eagerly the journal is written back to the origin.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteBack {
+    /// Journal usage above which write-back runs regardless of idleness, as a
+    /// percentage of the ring.
+    pub high_watermark: u64,
+    /// Stop writing back once usage drops below this percentage.
+    pub low_watermark: u64,
+    /// Block a write when usage is above this percentage, waiting for the
+    /// background writer to make room.
+    pub max_watermark: u64,
+    /// Blocks written back per step. Kept modest so IO stays responsive.
+    pub step_blocks: usize,
+    /// How long the journal may sit dirty before an idle write-back kicks in.
+    pub idle: std::time::Duration,
+}
+
+impl Default for WriteBack {
+    fn default() -> Self {
+        WriteBack {
+            high_watermark: 50,
+            low_watermark: 20,
+            max_watermark: 90,
+            step_blocks: 1024, // 4 MiB at BLOCK = 4096
+            idle: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
 /// Everything a queue thread needs.
 struct Shared {
     cache: Arc<Mutex<Cache>>,
+    /// Set once a write had to wait for space, to wake the background writer.
+    wake: Arc<SpaceSignal>,
+    /// Journal usage above which a write waits instead of draining inline.
+    max_watermark: u64,
+}
+
+fn usage_pct(c: &Cache) -> u64 {
+    let len = c.log.hdr.log_len.max(1);
+    c.log.used().saturating_mul(100) / len
 }
 
 impl Shared {
@@ -35,6 +73,129 @@ impl Shared {
         self.cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Signals a writer that is waiting for journal space.
+type SpaceSignal = (Mutex<bool>, std::sync::Condvar);
+
+/// Handle for stopping the background writer.
+struct WriteBackThread {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl WriteBackThread {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Background write-back.
+///
+/// Two triggers, checked every tick:
+///
+/// * **high watermark / a waiting writer** — usage above `high_watermark`, or
+///   a write blocked at `max_watermark`; write back until `low_watermark`.
+/// * **idle** — the journal has not changed for `idle`, so dirty data from a
+///   quiet workload still reaches the origin without waiting for a flush.
+///
+/// Each step writes at most `step_blocks` blocks, so a big batch of dirty data
+/// does not monopolise the origin.
+fn spawn_write_back(
+    cache: Arc<Mutex<Cache>>,
+    wake: Arc<SpaceSignal>,
+    wb: WriteBack,
+) -> WriteBackThread {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let handle = thread::spawn(move || {
+        let mut last_used = u64::MAX;
+        let mut last_change = std::time::Instant::now();
+        // Set while an idle write-back is running; it keeps going until the
+        // journal is empty so a quiet workload does not leave dirty data
+        // sitting in the ring for one step at a time.
+        let mut draining = false;
+
+        while !stop2.load(Ordering::SeqCst) {
+            let (used, pct) = {
+                let c = cache.lock().unwrap_or_else(|p| p.into_inner());
+                (c.log.used(), usage_pct(&c))
+            };
+            let forced = *wake.0.lock().unwrap_or_else(|p| p.into_inner());
+            if used != last_used {
+                last_used = used;
+                last_change = std::time::Instant::now();
+            }
+
+            if used == 0 {
+                draining = false;
+                thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+
+            // Start an idle drain after a quiet period, or when the ring is
+            // filling up, or because a writer is blocked at the max watermark.
+            let start_drain = forced
+                || pct >= wb.high_watermark
+                || last_change.elapsed() >= wb.idle;
+            if !draining && start_drain {
+                draining = true;
+                log::debug!("write-back: start drain at {pct}% (forced={forced})");
+            }
+            if !draining {
+                thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+
+            // Consume the wake flag and make room for exactly one step.
+            {
+                let mut guard = wake.0.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = false;
+            }
+            let res = {
+                let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());
+                c.write_back_step(wb.step_blocks)
+            };
+            match res {
+                Ok(0) => {
+                    draining = false;
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(_) => {
+                    // Release writers waiting at the max watermark.
+                    {
+                        let _g = wake.0.lock().unwrap_or_else(|p| p.into_inner());
+                        wake.1.notify_all();
+                    }
+                    // An idle drain runs until the journal is (nearly) empty;
+                    // the low watermark only decides when a drain *starts*
+                    // being optional. Writers waiting at the max watermark
+                    // keep it going regardless.
+                    let (remaining, log_len) = {
+                        let c = cache.lock().unwrap_or_else(|p| p.into_inner());
+                        (c.log.used(), c.log.hdr.log_len)
+                    };
+                    let waiting = *wake.0.lock().unwrap_or_else(|p| p.into_inner());
+                    let low_water = wb.low_watermark.saturating_mul(log_len) / 100;
+                    if remaining <= low_water && !waiting {
+                        draining = false;
+                    }
+                }
+                Err(e) => {
+                    log::error!("write-back step failed: {e:#}");
+                    draining = false;
+                    thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+        }
+    });
+    WriteBackThread {
+        stop,
+        handle: Some(handle),
     }
 }
 
@@ -50,6 +211,7 @@ pub struct Target {
     pub origin: PathBuf,
     pub queues: u16,
     pub depth: u16,
+    pub write_back: WriteBack,
 }
 
 impl Target {
@@ -68,10 +230,15 @@ impl Target {
         drop(cache);
 
         let cache = Arc::new(Mutex::new(open_cache(&self.cache, &self.origin)?));
+        let wake = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let wb = self.write_back;
         let max_io = BLOCK as usize * 64;
         let shared = Arc::new(Shared {
-            cache,
+            cache: cache.clone(),
+            wake: wake.clone(),
+            max_watermark: wb.max_watermark,
         });
+        let writer = spawn_write_back(cache.clone(), wake, wb);
 
         let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
             .name("rcache")
@@ -81,7 +248,14 @@ impl Target {
             .io_buf_bytes(max_io as u32)
             .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
-            .map_err(|e| anyhow::anyhow!("ublk ctrl build failed: {e:?}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to create ublk device id={}: {e:?}\n                     hint: another /dev/ublkb*/ublkc* may still be in use; \
+                     check `ls /sys/class/ublk-char` and stop leftover devices \
+                     with `rcache stop --id N`",
+                    self.id
+                )
+            })?;
 
         let tgt_init = move |dev: &mut UblkDev| -> Result<(), UblkError> {
             dev.set_default_params(dev_size);
@@ -121,12 +295,14 @@ impl Target {
                 let b = &bufs2[tag as usize];
                 // The per-tag buffer is `max_io_buf_bytes` wide; the command
                 // itself may be shorter, so hand the op only its own bytes.
-                let want = (q.get_iod(tag).nr_sectors as usize) * 512;
-                let want = want.min(b.len());
-                // SAFETY: one in-flight command per tag per queue thread; the
-                // slice is rebuilt for this tag only, so no aliasing is possible.
+                // Always hand over the whole tag buffer: a command may be
+                // larger than the buffer, and handle_command serves it in
+                // windows of this same memory.
+                //
+                // SAFETY: one in-flight command per tag per queue thread, so no
+                // other handle touches this buffer while we serve `tag`.
                 let buf = unsafe {
-                    std::slice::from_raw_parts_mut(b.as_ptr() as *mut u8, want)
+                    std::slice::from_raw_parts_mut(b.as_ptr() as *mut u8, b.len())
                 };
                 let res = handle_command(&s2, q, tag, io, buf, b.as_ptr() as *mut u8);
                 if let Err(UblkError::QueueIsDown) = res {
@@ -157,7 +333,8 @@ impl Target {
 
         let _ = ctrl.run_target(tgt_init, q_fn, device_fn);
 
-        // Device is gone: make sure the origin is complete before exiting.
+        // Stop the background writer, then do the final drain.
+        writer.stop();
         let mut c = shared.lock();
         c.flush().context("final journal drain failed")?;
         log::info!("rcache: stopped, journal drained");
@@ -186,16 +363,42 @@ fn handle_command(
     // one), so compute the byte offset without overflowing.
     let sector = iod.start_sector.wrapping_mul(512);
     let bytes = (iod.nr_sectors as usize) * 512;
-    let res = process_op(&s.cache, op, sector, bytes, buf);
+    let space = (s.wake.as_ref(), s.max_watermark);
+
+    // One ublk command may be larger than this tag's buffer. Serve it in
+    // windows of the tag buffer: the data lives there, so each window is
+    // processed in place (no copy) before moving on.
+    let buf_len = buf.len();
+    let res = if buf_len > 0 && bytes > buf_len && op != libublk::sys::UBLK_IO_OP_FLUSH {
+        let mut res: i32 = 0;
+        let mut off = 0usize;
+        while off < bytes {
+            let n = (bytes - off).min(buf_len);
+            let piece = &mut buf[..n];
+            let r = process_op_shared(&s.cache, Some(space), op, sector + off as u64, n, piece);
+            if r < 0 {
+                res = r;
+                break;
+            }
+            res += r;
+            off += n;
+        }
+        res
+    } else {
+        // The command fits in the tag buffer: hand over exactly its bytes.
+        let n = bytes.min(buf_len);
+        process_op_shared(&s.cache, Some(space), op, sector, n, &mut buf[..n])
+    };
 
     // COMMIT must carry the same buffer address the FETCH used. For FLUSH
     // (`bytes == 0`) the buffer we were handed is zero length, so pass the
     // tag's real buffer rather than an empty slice (which would send NULL and
     // wedge the tag).
-    let commit = if bytes == 0 {
+    let commit = if bytes == 0 || buf_len == 0 {
         BufDesc::RawAddress(tag_buf_addr as *const u8)
     } else {
-        BufDesc::Slice(&buf[..bytes])
+        // Never hand libublk a slice longer than the tag buffer.
+        BufDesc::Slice(&buf[..bytes.min(buf_len)])
     };
     q.complete_io_cmd_unified(tag, commit, Ok(UblkIORes::Result(res)))?;
     Ok(())
@@ -205,8 +408,23 @@ fn handle_command(
 /// (bytes transferred, 0 for flush, or a negative errno).
 ///
 /// Kept independent of ublk so the same path can be exercised from tests.
+#[cfg(test)]
 pub fn process_op(
     cache: &Mutex<Cache>,
+    op: u32,
+    sector: u64,
+    bytes: usize,
+    buf: &mut [u8],
+) -> i32 {
+    process_op_shared(cache, None, op, sector, bytes, buf)
+}
+
+/// Same as [`process_op`], but with the background-writer hook: a write that
+/// finds the journal past the max watermark waits for it to catch up instead
+/// of draining inline (which would stall the queue for the whole ring).
+pub fn process_op_shared(
+    cache: &Mutex<Cache>,
+    space: Option<(&SpaceSignal, u64)>,
     op: u32,
     sector: u64,
     bytes: usize,
@@ -242,6 +460,9 @@ pub fn process_op(
             }
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
+            if let Some((wake, max_pct)) = space {
+                wait_for_space(cache, wake, max_pct);
+            }
             if aligned {
                 match lock().write(blk, nblocks, buf) {
                     Ok(()) => bytes as i32,
@@ -309,6 +530,32 @@ fn write_slice(
     whole[off..off + data.len()].copy_from_slice(data);
     c.write(blk, nblocks, &whole)
         .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Block until the journal is below `max_pct`, asking the background writer to
+/// make room. Returns immediately when there is already space.
+fn wait_for_space(
+    cache: &Mutex<Cache>,
+    wake: &SpaceSignal,
+    max_pct: u64,
+) {
+    let mut asked = wake.0.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        let pct = {
+            let c = cache.lock().unwrap_or_else(|p| p.into_inner());
+            usage_pct(&c)
+        };
+        if pct < max_pct {
+            return;
+        }
+        *asked = true;
+        wake.1.notify_all();
+        let (guard, _) = wake
+            .1
+            .wait_timeout(asked, std::time::Duration::from_millis(50))
+            .unwrap_or_else(|p| p.into_inner());
+        asked = guard;
+    }
 }
 
 /// `value` is a whole multiple of `unit`.
@@ -462,6 +709,49 @@ mod tests {
         assert_eq!(o[0], 0xAA);
         assert_eq!(o[2048], 0xAA);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A command larger than the tag buffer must be served in windows and land
+    /// completely on the origin; truncating it silently would corrupt data.
+    #[test]
+    fn windowed_command_larger_than_buffer() {
+        let dir = std::env::temp_dir().join(format!("rcache-win-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let origin = dir.join("origin.img");
+        std::fs::File::create(&origin).unwrap().set_len(8 << 20).unwrap();
+        let cache_path = dir.join("cache.img");
+        let cache = Mutex::new(Cache::open(&cache_path, &origin).unwrap());
+
+        let chunk = 64 * BLOCK as usize; // the tag buffer size
+        let blocks = 512usize; // 2 MiB, far bigger than `chunk`
+        let mut data = vec![0u8; blocks * BLOCK as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i * 7 % 253) as u8;
+        }
+
+        // Windowed write, exactly like handle_command does it.
+        let mut off = 0usize;
+        while off < data.len() {
+            let n = (data.len() - off).min(chunk);
+            let mut piece = data[off..off + n].to_vec();
+            let r = process_op(
+                &cache,
+                libublk::sys::UBLK_IO_OP_WRITE,
+                (100 * BLOCK) + off as u64,
+                n,
+                &mut piece,
+            );
+            assert_eq!(r, n as i32);
+            off += n;
+        }
+        cache.lock().unwrap().flush().unwrap();
+
+        for i in 0..blocks {
+            let ob = origin_block(&origin, 100 + i as u64);
+            let o = i * BLOCK as usize;
+            assert_eq!(ob[..], data[o..o + BLOCK as usize], "block {} wrong", 100 + i);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

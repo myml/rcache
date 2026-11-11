@@ -186,7 +186,9 @@ impl Log {
                 if hdr.head >= hdr.log_len || hdr.tail >= hdr.log_len {
                     anyhow::bail!(
                         "journal pointers out of range (head {} tail {} ring {})",
-                        hdr.head, hdr.tail, hdr.log_len
+                        hdr.head,
+                        hdr.tail,
+                        hdr.log_len
                     );
                 }
                 return Ok(Log {
@@ -290,7 +292,11 @@ impl Log {
     pub fn append(&mut self, blk: u64, data: &[u8]) -> anyhow::Result<(u32, u64)> {
         let padded = round_up(data.len() as u64, SECTOR);
         if !self.can_fit(data.len() as u64) {
-            anyhow::bail!("journal full (used {} of {} ring)", self.used(), self.hdr.log_len);
+            anyhow::bail!(
+                "journal full (used {} of {} ring)",
+                self.used(),
+                self.hdr.log_len
+            );
         }
         let version = self.hdr.next_version;
         let hdr = RecHdr {
@@ -343,8 +349,7 @@ impl Log {
     /// Read the payload of a record found at `pos` (0 <= pos < log_len).
     pub fn read_record(&self, pos: u64) -> anyhow::Result<Option<(RecHdr, Vec<u8>)>> {
         let mut h = [0u8; REC_HDR];
-        self.file
-            .read_exact_at(&mut h, self.hdr.log_off + pos)?;
+        self.file.read_exact_at(&mut h, self.hdr.log_off + pos)?;
         let hdr = RecHdr::decode(&h);
         if hdr.len == 0 || hdr.len as u64 > self.hdr.log_len {
             return Ok(None);
@@ -439,7 +444,6 @@ impl Log {
         self.hdr.tail = 0;
         self.sync_header()
     }
-
 }
 
 #[cfg(test)]

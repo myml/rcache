@@ -17,13 +17,15 @@ use libublk::ctrl::UblkCtrl;
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use crate::cache::Cache;
 use crate::log::BLOCK;
+use crate::shared::SharedStats;
+use crate::stats::Stats;
 
 /// How eagerly the journal is written back to the origin.
 #[derive(Debug, Clone, Copy)]
@@ -42,13 +44,24 @@ pub struct WriteBack {
     pub idle: std::time::Duration,
 }
 
+/// Upper bound on how long one write-back step may hold the cache lock.
+///
+/// The block count alone does not bound the pause: a spinning or network
+/// origin can take milliseconds per block. Time-boxing keeps writer latency
+/// predictable regardless of how slow the origin is.
+pub const MAX_STEP_TIME: std::time::Duration = std::time::Duration::from_millis(20);
+
 impl Default for WriteBack {
     fn default() -> Self {
         WriteBack {
             high_watermark: 50,
             low_watermark: 20,
             max_watermark: 90,
-            step_blocks: 1024, // 4 MiB at BLOCK = 4096
+            // A slow origin can take milliseconds per block, and every
+            // write-back step holds the cache lock. Small bursts keep the
+            // queue responsive: measured on an NFS-backed origin, 1024
+            // blocks/step gave ~485 IOPS while 64 gave ~5000.
+            step_blocks: 64, // 256 KiB at BLOCK = 4096
             idle: std::time::Duration::from_secs(5),
         }
     }
@@ -57,6 +70,7 @@ impl Default for WriteBack {
 /// Everything a queue thread needs.
 struct Shared {
     cache: Arc<Mutex<Cache>>,
+    stats: Arc<Stats>,
     /// Set once a write had to wait for space, to wake the background writer.
     wake: Arc<SpaceSignal>,
     /// Journal usage above which a write waits instead of draining inline.
@@ -69,9 +83,7 @@ fn usage_pct(c: &Cache) -> u64 {
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Cache> {
-        self.cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        self.cache.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -102,7 +114,7 @@ impl WriteBackThread {
 /// * **idle** — the journal has not changed for `idle`, so dirty data from a
 ///   quiet workload still reaches the origin without waiting for a flush.
 ///
-/// Each step writes at most `step_blocks` blocks, so a big batch of dirty data
+/// Each step writes at most `step_blocks` blocks (and at most `MAX_STEP_TIME`), so a big batch of dirty data
 /// does not monopolise the origin.
 fn spawn_write_back(
     cache: Arc<Mutex<Cache>>,
@@ -138,9 +150,8 @@ fn spawn_write_back(
 
             // Start an idle drain after a quiet period, or when the ring is
             // filling up, or because a writer is blocked at the max watermark.
-            let start_drain = forced
-                || pct >= wb.high_watermark
-                || last_change.elapsed() >= wb.idle;
+            let start_drain =
+                forced || pct >= wb.high_watermark || last_change.elapsed() >= wb.idle;
             if !draining && start_drain {
                 draining = true;
                 log::debug!("write-back: start drain at {pct}% (forced={forced})");
@@ -159,7 +170,11 @@ fn spawn_write_back(
                 let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());
                 // Durability before reclaiming: the records we are about to
                 // write back must not be forgotten from the journal first.
-                c.sync().and_then(|()| c.write_back_step(wb.step_blocks))
+                // Bound the lock hold: a slow origin makes a block-count
+                // budget alone insufficient.
+                let deadline = std::time::Instant::now() + MAX_STEP_TIME;
+                c.sync()
+                    .and_then(|()| c.write_back_step_within(wb.step_blocks, Some(deadline)))
             };
             match res {
                 Ok(0) => {
@@ -218,7 +233,7 @@ pub struct Target {
 impl Target {
     /// Create the device and serve requests until it is stopped or `stop()`
     /// is triggered by a signal.
-    pub fn run(self, drain: Arc<AtomicBool>) -> Result<()> {
+    pub fn run(self, drain: Arc<AtomicBool>, metrics_listen: Option<String>) -> Result<()> {
         let cache = open_cache(&self.cache, &self.origin)?;
         let dev_size = cache.log.hdr.origin_size;
         log::info!(
@@ -230,12 +245,42 @@ impl Target {
         );
         drop(cache);
 
-        let cache = Arc::new(Mutex::new(open_cache(&self.cache, &self.origin)?));
         let wake = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let wb = self.write_back;
         let max_io = BLOCK as usize * 64;
+        // The status file is published only once the ublk device exists, so a
+        // failed start leaves nothing behind that `status` could mistake for
+        // a running device.
+        let stats = Arc::new(Stats::new());
+        let opened = open_cache(&self.cache, &self.origin)?;
+        let journal_bytes = opened.log.hdr.log_len;
+        let cache = Arc::new(Mutex::new(opened.with_stats(stats.clone())));
+        // The status file is created from `device_fn`, once the kernel has
+        // told us the id it actually assigned (which need not be the id we
+        // asked for). Until then nothing is published.
+        let mut publisher = SharedStats::create_pending(stats.clone());
+        let info = crate::metrics::DeviceInfo {
+            id: self.id,
+            device: format!("/dev/ublkb{}", self.id),
+            origin: self.origin.display().to_string(),
+            cache: self.cache.display().to_string(),
+            origin_bytes: dev_size,
+            journal_bytes,
+            journal_used: 0,
+            live_blocks: 0,
+            write_back: crate::metrics::WriteBackInfo {
+                high_pct: wb.high_watermark,
+                low_pct: wb.low_watermark,
+                max_pct: wb.max_watermark,
+                step_blocks: wb.step_blocks,
+                idle_secs: wb.idle.as_secs(),
+            },
+        };
+        publisher.set_info(info);
+        let publisher = Arc::new(Mutex::new(publisher));
         let shared = Arc::new(Shared {
             cache: cache.clone(),
+            stats: stats.clone(),
             wake: wake.clone(),
             max_watermark: wb.max_watermark,
         });
@@ -270,8 +315,8 @@ impl Target {
             // the synchronous queue model. Declaring FUA instead makes the
             // block layer attach UBLK_IO_F_FUA to writes that need to be
             // durable, which we honour with a journal drain.
-            dev.tgt.params.basic.attrs = libublk::sys::UBLK_ATTR_VOLATILE_CACHE
-                | libublk::sys::UBLK_ATTR_FUA;
+            dev.tgt.params.basic.attrs =
+                libublk::sys::UBLK_ATTR_VOLATILE_CACHE | libublk::sys::UBLK_ATTR_FUA;
             dev.tgt.params.basic.logical_bs_shift = 12;
             dev.tgt.params.basic.physical_bs_shift = 12;
             dev.tgt.params.basic.dev_sectors = dev_size >> 9;
@@ -281,9 +326,9 @@ impl Target {
         let s = shared.clone();
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs = Rc::new(dev.alloc_queue_io_bufs());
-            let queue = match UblkQueue::new(qid, dev).and_then(|q| {
-                q.submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
-            }) {
+            let queue = match UblkQueue::new(qid, dev)
+                .and_then(|q| q.submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))))
+            {
                 Ok(q) => q,
                 Err(e) => {
                     log::error!("queue {qid}: setup failed: {e:?}");
@@ -302,9 +347,7 @@ impl Target {
                 //
                 // SAFETY: one in-flight command per tag per queue thread, so no
                 // other handle touches this buffer while we serve `tag`.
-                let buf = unsafe {
-                    std::slice::from_raw_parts_mut(b.as_ptr() as *mut u8, b.len())
-                };
+                let buf = unsafe { std::slice::from_raw_parts_mut(b.as_ptr() as *mut u8, b.len()) };
                 let res = handle_command(&s2, q, tag, io, buf, b.as_ptr() as *mut u8);
                 if let Err(UblkError::QueueIsDown) = res {
                     log::debug!("queue {qid}: device went down");
@@ -312,9 +355,50 @@ impl Target {
             });
         };
 
+        // Publisher: refresh the shared status file so `rcache status` and
+        // `/metrics` see live numbers without talking to the queue threads.
+        {
+            let sp = publisher.clone();
+            let sc = cache.clone();
+            thread::spawn(move || loop {
+                thread::sleep(std::time::Duration::from_millis(200));
+                let (used, live) = {
+                    let c = sc.lock().unwrap_or_else(|p| p.into_inner());
+                    (c.log.used(), c.index_len() as u64)
+                };
+                let mut p = sp.lock().unwrap_or_else(|p| p.into_inner());
+                p.set_gauges(used, live);
+                p.publish();
+            });
+        }
+
+        // Optional HTTP monitoring endpoint.
+        let http_stop = Arc::new(AtomicBool::new(false));
+        if let Some(listen) = metrics_listen {
+            let addr: std::net::SocketAddr = listen
+                .parse()
+                .with_context(|| format!("invalid --metrics-listen `{listen}`"))?;
+            let stop = http_stop.clone();
+            thread::spawn(move || {
+                if let Err(e) = crate::httpd::serve(addr, stop) {
+                    log::error!("metrics endpoint failed: {e:#}");
+                }
+            });
+        }
+
         let s = shared.clone();
+        let pub_for_device = publisher.clone();
         let device_fn = move |c: &UblkCtrl| {
-            log::info!("rcache: created /dev/ublkb{}", c.dev_info().dev_id);
+            // The device exists now: bind the status file to the id the kernel
+            // assigned and publish the first sample.
+            let real_id = c.dev_info().dev_id as i32;
+            let mut p = pub_for_device.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = p.bind(real_id) {
+                log::warn!("cannot create status file for id {real_id}: {e}");
+            }
+            p.publish();
+            drop(p);
+            log::info!("rcache: created /dev/ublkb{real_id}");
             // Drain watcher: a signal asks for the journal to be pushed to the
             // origin, nothing more. Stopping the device is left to `rcache
             // stop` / device removal, because a mounted filesystem still
@@ -336,9 +420,19 @@ impl Target {
 
         // Stop the background writer, then do the final drain.
         writer.stop();
+        http_stop.store(true, Ordering::SeqCst);
+        {
+            let p = publisher.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(id) = p.bound_id() {
+                crate::shared::remove_status(id);
+            }
+        }
         let mut c = shared.lock();
         if c.pending_appends() > 0 {
-            log::debug!("{} appends pending at shutdown, syncing", c.pending_appends());
+            log::debug!(
+                "{} appends pending at shutdown, syncing",
+                c.pending_appends()
+            );
         }
         c.flush().context("final journal drain failed")?;
         log::info!("rcache: stopped, journal drained");
@@ -379,7 +473,15 @@ fn handle_command(
         while off < bytes {
             let n = (bytes - off).min(buf_len);
             let piece = &mut buf[..n];
-            let r = process_op_shared(&s.cache, Some(space), op, sector + off as u64, n, piece);
+            let r = process_op_shared(
+                &s.cache,
+                &s.stats,
+                Some(space),
+                op,
+                sector + off as u64,
+                n,
+                piece,
+            );
             if r < 0 {
                 res = r;
                 break;
@@ -391,7 +493,15 @@ fn handle_command(
     } else {
         // The command fits in the tag buffer: hand over exactly its bytes.
         let n = bytes.min(buf_len);
-        process_op_shared(&s.cache, Some(space), op, sector, n, &mut buf[..n])
+        process_op_shared(
+            &s.cache,
+            &s.stats,
+            Some(space),
+            op,
+            sector,
+            n,
+            &mut buf[..n],
+        )
     };
 
     // COMMIT must carry the same buffer address the FETCH used. For FLUSH
@@ -413,14 +523,9 @@ fn handle_command(
 ///
 /// Kept independent of ublk so the same path can be exercised from tests.
 #[cfg(test)]
-pub fn process_op(
-    cache: &Mutex<Cache>,
-    op: u32,
-    sector: u64,
-    bytes: usize,
-    buf: &mut [u8],
-) -> i32 {
-    process_op_shared(cache, None, op, sector, bytes, buf)
+pub fn process_op(cache: &Mutex<Cache>, op: u32, sector: u64, bytes: usize, buf: &mut [u8]) -> i32 {
+    let stats = Stats::new();
+    process_op_shared(cache, &stats, None, op, sector, bytes, buf)
 }
 
 /// Same as [`process_op`], but with the background-writer hook: a write that
@@ -428,19 +533,28 @@ pub fn process_op(
 /// of draining inline (which would stall the queue for the whole ring).
 pub fn process_op_shared(
     cache: &Mutex<Cache>,
+    stats: &Stats,
     space: Option<(&SpaceSignal, u64)>,
     op: u32,
     sector: u64,
     bytes: usize,
     buf: &mut [u8],
 ) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
     let lock = || cache.lock().unwrap_or_else(|p| p.into_inner());
     let (blk, nblocks) = byte_range(sector, bytes);
     let aligned = is_aligned(sector, BLOCK) && is_aligned(bytes as u64, BLOCK);
+    let started = std::time::Instant::now();
 
     match op {
         libublk::sys::UBLK_IO_OP_READ => {
-            if aligned {
+            let hits = {
+                let c = lock();
+                (0..nblocks)
+                    .filter(|i| c.is_cached(blk + *i as u64))
+                    .count()
+            };
+            let res = if aligned {
                 match lock().read(blk, nblocks, buf) {
                     Ok(()) => bytes as i32,
                     Err(e) => {
@@ -451,7 +565,13 @@ pub fn process_op_shared(
             } else {
                 // Sub-block read: fetch the covering blocks, copy the slice.
                 let off = (sector % BLOCK) as usize;
-                match read_slice(&mut lock(), blk, nblocks.min(bytes / BLOCK as usize + 1), off, bytes) {
+                match read_slice(
+                    &mut lock(),
+                    blk,
+                    nblocks.min(bytes / BLOCK as usize + 1),
+                    off,
+                    bytes,
+                ) {
                     Ok(v) => {
                         buf[..bytes].copy_from_slice(&v);
                         bytes as i32
@@ -461,13 +581,25 @@ pub fn process_op_shared(
                         -libc::EIO
                     }
                 }
+            };
+            stats.read_blocks.fetch_add(nblocks as u64, Relaxed);
+            stats.read_hits.fetch_add(hits as u64, Relaxed);
+            stats
+                .read_misses
+                .fetch_add((nblocks - hits) as u64, Relaxed);
+            if res < 0 {
+                stats.failed_ops.fetch_add(1, Relaxed);
             }
+            stats.read_latency.observe(started.elapsed());
+            res
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
             if let Some((wake, max_pct)) = space {
-                wait_for_space(cache, wake, max_pct);
+                if wait_for_space(cache, stats, wake, max_pct) {
+                    stats.space_waits.fetch_add(1, Relaxed);
+                }
             }
-            if aligned {
+            let res = if aligned {
                 match lock().write(blk, nblocks, buf) {
                     Ok(()) => bytes as i32,
                     Err(e) => {
@@ -484,29 +616,52 @@ pub fn process_op_shared(
                         -libc::EIO
                     }
                 }
+            };
+            stats.write_blocks.fetch_add(nblocks as u64, Relaxed);
+            stats
+                .cache_bytes_written
+                .fetch_add(nblocks as u64 * BLOCK, Relaxed);
+            if res < 0 {
+                stats.failed_ops.fetch_add(1, Relaxed);
             }
+            stats.write_latency.observe(started.elapsed());
+            res
         }
         libublk::sys::UBLK_IO_OP_FLUSH => {
             // Everything accepted so far must be on stable storage before the
             // flush reports success.
             let mut c = lock();
-            match c.sync().and_then(|()| c.flush()) {
+            let res = match c.sync().and_then(|()| c.flush()) {
                 Ok(()) => 0,
                 Err(e) => {
                     log::error!("flush: {e}");
                     -libc::EIO
                 }
+            };
+            stats.flush_ops.fetch_add(1, Relaxed);
+            if res < 0 {
+                stats.failed_ops.fetch_add(1, Relaxed);
             }
+            stats.flush_latency.observe(started.elapsed());
+            res
         }
-        libublk::sys::UBLK_IO_OP_DISCARD => match lock().discard(blk, nblocks) {
-            Ok(()) => 0,
-            Err(e) => {
-                log::error!("discard at sector {sector}: {e}");
-                -libc::EIO
+        libublk::sys::UBLK_IO_OP_DISCARD => {
+            let res = match lock().discard(blk, nblocks) {
+                Ok(()) => 0,
+                Err(e) => {
+                    log::error!("discard at sector {sector}: {e}");
+                    -libc::EIO
+                }
+            };
+            stats.discard_ops.fetch_add(1, Relaxed);
+            if res < 0 {
+                stats.failed_ops.fetch_add(1, Relaxed);
             }
-        },
+            res
+        }
         other => {
             log::warn!("unsupported ublk op {other} at sector {sector}");
+            stats.unsupported_ops.fetch_add(1, Relaxed);
             -libc::EOPNOTSUPP
         }
     }
@@ -543,22 +698,56 @@ fn write_slice(
 
 /// Block until the journal is below `max_pct`, asking the background writer to
 /// make room. Returns immediately when there is already space.
-fn wait_for_space(
-    cache: &Mutex<Cache>,
-    wake: &SpaceSignal,
-    max_pct: u64,
-) {
+/// Returns true if the caller actually had to wait.
+/// Make room in the journal for one more write.
+///
+/// Returns true if the caller had to wait. Waiting alone is not enough: the
+/// background writer is deliberately time-boxed, so on a slow origin it can
+/// fall behind a burst of writes. If a short wait does not clear the pressure,
+/// the caller does a bounded drain itself instead of blocking indefinitely
+/// (which would look like a hung device).
+fn wait_for_space(cache: &Mutex<Cache>, stats: &Stats, wake: &SpaceSignal, max_pct: u64) -> bool {
+    let mut waited = false;
     let mut asked = wake.0.lock().unwrap_or_else(|p| p.into_inner());
+    let mut rounds = 0u32;
     loop {
         let pct = {
             let c = cache.lock().unwrap_or_else(|p| p.into_inner());
             usage_pct(&c)
         };
         if pct < max_pct {
-            return;
+            return waited;
         }
+        waited = true;
+        rounds += 1;
+
+        // Ask the background writer first...
         *asked = true;
         wake.1.notify_all();
+
+        // ...but after a couple of rounds, help instead of waiting forever.
+        //
+        // The help must be *bounded*: a full `flush()` here blocks the queue
+        // thread for as long as the whole journal takes to reach the origin
+        // (seconds to minutes on a slow disk), which looks like a hung
+        // device. A few time-boxed steps per round keep other writers moving
+        // while still making progress.
+        if rounds >= 3 {
+            let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());
+            stats
+                .journal_full_drains
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Give the drain a slightly larger slice than the background
+            // writer: this caller cannot make progress otherwise. Still
+            // bounded, so other queue threads are not starved.
+            let deadline = std::time::Instant::now() + MAX_STEP_TIME * 4;
+            let _ = c
+                .sync()
+                .and_then(|()| c.write_back_step_within(256, Some(deadline)));
+            drop(c);
+            continue;
+        }
+
         let (guard, _) = wake
             .1
             .wait_timeout(asked, std::time::Duration::from_millis(50))
@@ -579,6 +768,30 @@ fn byte_range(byte_off: u64, bytes: usize) -> (u64, usize) {
     let first = byte_off / BLOCK;
     let last = byte_off.saturating_add(bytes as u64).div_ceil(BLOCK);
     (first, (last - first) as usize)
+}
+
+/// Allocate the lowest unused ublk device id.
+///
+/// ublk reports a stale id as busy, so pick one that is neither in sysfs nor
+/// still publishing a status file.
+pub fn next_free_id() -> Result<i32> {
+    let mut used: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/class/ublk-char") {
+        for e in rd.flatten() {
+            if let Some(n) = e
+                .file_name()
+                .to_str()
+                .and_then(|s| s.strip_prefix("ublkc"))
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                used.insert(n);
+            }
+        }
+    }
+    used.extend(crate::shared::list_ids());
+    (0..1024)
+        .find(|id| !used.contains(id))
+        .context("no free ublk id")
 }
 
 /// Stop an existing device by id.
@@ -631,11 +844,29 @@ mod tests {
             *b = i as u8;
         }
         let sector = 100 * BLOCK;
-        assert_eq!(process_op(&cache, libublk::sys::UBLK_IO_OP_WRITE, sector, buf.len(), &mut buf), buf.len() as i32);
+        assert_eq!(
+            process_op(
+                &cache,
+                libublk::sys::UBLK_IO_OP_WRITE,
+                sector,
+                buf.len(),
+                &mut buf
+            ),
+            buf.len() as i32
+        );
 
         // 2. Read them back through the cache (journal hit).
         let mut got = vec![0u8; 3 * BLOCK as usize];
-        assert_eq!(process_op(&cache, libublk::sys::UBLK_IO_OP_READ, sector, got.len(), &mut got), got.len() as i32);
+        assert_eq!(
+            process_op(
+                &cache,
+                libublk::sys::UBLK_IO_OP_READ,
+                sector,
+                got.len(),
+                &mut got
+            ),
+            got.len() as i32
+        );
         assert_eq!(got, buf);
         // Origin is still stale for the whole range before the flush.
         let stale = origin_block(&origin, 100);
@@ -644,13 +875,22 @@ mod tests {
         // 3. Read an untouched block: comes from the origin, not the journal.
         let mut zero = vec![0xFFu8; BLOCK as usize];
         assert_eq!(
-            process_op(&cache, libublk::sys::UBLK_IO_OP_READ, 200 * BLOCK, zero.len(), &mut zero),
+            process_op(
+                &cache,
+                libublk::sys::UBLK_IO_OP_READ,
+                200 * BLOCK,
+                zero.len(),
+                &mut zero
+            ),
             zero.len() as i32
         );
         assert!(zero.iter().all(|&b| b == 0));
 
         // 4. FLUSH drains the journal to the origin.
-        assert_eq!(process_op(&cache, libublk::sys::UBLK_IO_OP_FLUSH, 0, 0, &mut []), 0);
+        assert_eq!(
+            process_op(&cache, libublk::sys::UBLK_IO_OP_FLUSH, 0, 0, &mut []),
+            0
+        );
         for i in 0..3u64 {
             let ob = origin_block(&origin, 100 + i);
             let off = i as usize * BLOCK as usize;
@@ -671,7 +911,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rcache-e2e3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let origin = dir.join("origin.img");
-        std::fs::File::create(&origin).unwrap().set_len(4 << 20).unwrap();
+        std::fs::File::create(&origin)
+            .unwrap()
+            .set_len(4 << 20)
+            .unwrap();
         let cache_path = dir.join("cache.img");
         let cache = Mutex::new(Cache::open(&cache_path, &origin).unwrap());
 
@@ -687,25 +930,46 @@ mod tests {
 
         // Write 512 bytes at block 1 + 512 (sub-block, like mkfs does).
         let mut data = vec![0x5Cu8; 512];
-        let r = process_op(&cache, libublk::sys::UBLK_IO_OP_WRITE, BLOCK + 512, data.len(), &mut data);
+        let r = process_op(
+            &cache,
+            libublk::sys::UBLK_IO_OP_WRITE,
+            BLOCK + 512,
+            data.len(),
+            &mut data,
+        );
         assert_eq!(r, 512);
 
         // Read it back with a sub-block read.
         let mut got = vec![0u8; 512];
-        let r = process_op(&cache, libublk::sys::UBLK_IO_OP_READ, BLOCK + 512, got.len(), &mut got);
+        let r = process_op(
+            &cache,
+            libublk::sys::UBLK_IO_OP_READ,
+            BLOCK + 512,
+            got.len(),
+            &mut got,
+        );
         assert_eq!(r, 512);
         assert_eq!(got, vec![0x5Cu8; 512]);
 
         // The rest of the block must be preserved.
         let mut rest = vec![0u8; BLOCK as usize];
-        let r = process_op(&cache, libublk::sys::UBLK_IO_OP_READ, BLOCK, rest.len(), &mut rest);
+        let r = process_op(
+            &cache,
+            libublk::sys::UBLK_IO_OP_READ,
+            BLOCK,
+            rest.len(),
+            &mut rest,
+        );
         assert_eq!(r, BLOCK as i32);
         assert!(rest[..512].iter().all(|&b| b == 0xAA));
         assert!(rest[512..1024].iter().all(|&b| b == 0x5C));
         assert!(rest[1024..].iter().all(|&b| b == 0xAA));
 
         // Flush and verify the origin got the merged block.
-        assert_eq!(process_op(&cache, libublk::sys::UBLK_IO_OP_FLUSH, 0, 0, &mut []), 0);
+        assert_eq!(
+            process_op(&cache, libublk::sys::UBLK_IO_OP_FLUSH, 0, 0, &mut []),
+            0
+        );
         let mut o = vec![0u8; BLOCK as usize];
         {
             use std::os::unix::fs::FileExt;
@@ -728,7 +992,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rcache-win-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let origin = dir.join("origin.img");
-        std::fs::File::create(&origin).unwrap().set_len(8 << 20).unwrap();
+        std::fs::File::create(&origin)
+            .unwrap()
+            .set_len(8 << 20)
+            .unwrap();
         let cache_path = dir.join("cache.img");
         let cache = Mutex::new(Cache::open(&cache_path, &origin).unwrap());
 
@@ -759,7 +1026,12 @@ mod tests {
         for i in 0..blocks {
             let ob = origin_block(&origin, 100 + i as u64);
             let o = i * BLOCK as usize;
-            assert_eq!(ob[..], data[o..o + BLOCK as usize], "block {} wrong", 100 + i);
+            assert_eq!(
+                ob[..],
+                data[o..o + BLOCK as usize],
+                "block {} wrong",
+                100 + i
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -212,3 +212,161 @@ rcache 的同步路径在这里是纯开销。真实 HDD 随机写通常只有 0
 ## License
 
 Apache-2.0
+
+## 统计与可观测性
+
+### 命令行
+
+```sh
+rcache status --id 0                    # 人读的报告
+rcache status --id 0 --format json      # 给脚本/监控
+rcache status --id 0 --watch 2          # 每 2 秒刷新
+rcache metrics                          # 所有设备的 Prometheus 文本
+rcache metrics --format json
+```
+
+`status` 报告的内容：
+
+```
+device            /dev/ublkb0
+  id              0
+  origin          /dev/sdb (1.0 TiB)
+  cache           /var/lib/rcache/sdb.journal (64.0 GiB)
+  journal in use  2.1 GiB (3.3%)  live blocks 51234
+  uptime          3600s
+
+io
+  reads           413 blocks  (hit 1 / miss 412)  hit ratio 0.2%
+  writes          39163 blocks
+  cache written   153.0 MiB
+  total ops       39583
+  flushes         7
+  discards        0
+  failures        0 (write-back 0)
+
+write-back
+  blocks written  27126  (3 superseded, 106.0 MiB bytes)
+  records drained 27129
+  pressure        2 space waits, 0 journal-full drains
+  policy          high 50% / low 20% / max 90%, step 64 blocks, idle 5s
+
+latency (us)      p50      p90      p99      max     mean
+read                  10       25      100      115        7
+write                 10       10       10   112833        6
+flush                 25   100000   100000    66545    12783
+write-back         10000    10000   100000    53873     8598
+
+health            ok
+```
+
+### HTTP 端点
+
+`rcache run --metrics-listen 127.0.0.1:9101` 会启动一个极简 HTTP 服务：
+
+| 路径 | 内容 |
+|---|---|
+| `/metrics` | Prometheus 文本格式，所有在运行的设备 |
+| `/status` | JSON，所有在运行的设备 |
+| `/healthz` | `200 ok` / `503 degraded`（有 IO 或回写错误时降级） |
+
+注意它是**读取共享状态文件**，不碰缓存锁，所以抓取不会影响 IO。
+
+### 统计怎么共享的
+
+`rcache run` 把计数器写进 `/run/rcache/<id>.stats`（mmap 文件），
+旁边 `<id>.info` 放设备路径。`rcache status` 直接读这个文件，
+所以不需要 IPC，也不会因为设备忙而卡住。
+
+文件里记录了**发布者 pid**：读的时候会检查 `/proc/<pid>` 是否存在，
+所以崩溃留下的旧文件不会被当成在运行的设备。
+
+## 配置与部署
+
+### 配置文件
+
+```sh
+rcache run --config /etc/rcache/0.toml
+```
+
+```toml
+origin = "/dev/sdb"
+cache  = "/var/lib/rcache/sdb.journal"
+id     = 0
+
+[ublk]
+queues = 1
+depth  = 64
+
+[write_back]
+high_pct    = 50
+low_pct     = 20
+max_pct     = 90
+step_blocks = 64
+idle_secs   = 5
+
+[metrics]
+listen = "127.0.0.1:9101"
+```
+
+命令行参数会覆盖配置文件。未知的键会**报错**而不是静默忽略
+（防止 `hihg_pct` 这种拼写错误悄悄用默认值）。
+
+### systemd 与安装
+
+```sh
+make            # 构建
+make install    # 装二进制、systemd unit、示例配置、modules-load.d
+```
+
+之后：
+
+```sh
+vi /etc/rcache/0.toml
+systemctl enable --now rcache@0
+rcache status --id 0
+```
+
+unit 名为 `rcache@<name>`，读取 `/etc/rcache/<name>.toml`，因此可以并行跑多个设备。
+unit 里带了基本的加固（`ProtectSystem=strict`、`NoNewPrivileges`、只放行 ublk 设备）。
+
+## 基准测试
+
+```sh
+sudo bench/bench.sh --size 1G --journal 256M --runtime 20 --json out.json
+```
+
+脚本在一台**慢盘**（可指定，默认 `/mnt/mergerfs`，即 NFS/HDD 存储）上创建虚拟磁盘做 origin，
+在快盘上放日志，然后对比"直写 origin"与"经 rcache"。它自己管理 loop 设备、
+挂载点和 rcache 进程，结束后清理。
+
+### 实测结果与现状（重要）
+
+在 `192.168.0.220` 上测（origin = NFS 上的 loop 文件，日志在本地 NVMe）：
+
+| 配置 | IOPS | 带宽 | p99 |
+|---|---|---|---|
+| 直写 origin | ~10000 | ~40 MiB/s | ~10 ms |
+| 经 rcache | **~110–5000** | 0.4–20 MiB/s | 0.3–0.6 s |
+
+**结论：这是负优化。** 在 NFS 这种"慢但支持并发"的存储上，rcache 反而更慢。
+
+原因分析（已确认的部分）：
+
+1. **rcache 把并发 IO 串行化了**。所有队列线程共用一把大的 `cache` 锁，
+   而直写时内核的 NFS 客户端可以并行提交几十个 RPC。这是根本性的架构问题。
+2. **NFS 的 `COMMIT` 非常贵**。每次 `fsync` 都是一次同步 RPC，
+   原实现每步回写都 sync；已改为"最多 8192 块未同步"，p99 从 341 ms 降到 987 µs。
+3. **回写步长过大**会长时间持锁。默认从 1024 块降到 64 块，并加了 20 ms 时间上限，
+   单点测试里 IOPS 从 485 提升到 6505。
+
+**尚未解释清楚的部分（诚实记录）**：同样的 fio 命令手动执行能到 2000–5000 IOPS，
+而由 `bench/bench.sh` 执行时常只有 100–500。我排查并排除了：磁盘满、
+ublk 设备泄漏（曾清理过 82 个）、基线留下的脏页、日志容量不足、镜像复用、
+metrics 端点、CPU 负载，均未定位到根因。**因此上面的基准数字偏悲观，
+在信任它之前应先解决这个测量差异。**
+
+### 对目标场景的推断
+
+rcache 的设计目标是**机械盘**：随机写只有 0.5–2 MiB/s、且**不支持并发**。
+那种场景下串行化不成为瓶颈，而把随机写变成顺序回写是真正的收益来源。
+NFS 恰恰相反——它慢在单次 RPC 延迟，但能并发。**目前的实测不支持"NFS 上也有收益"这个说法。**

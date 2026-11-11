@@ -1,0 +1,35 @@
+# Sample /etc/rcache/0.toml -- installed as rcache@0.service
+#
+# Every key is optional except `origin` and `cache`. Command-line flags passed
+# to `rcache run` override the file.
+
+# The slow device being cached. Its contents are never reformatted; rcache
+# only reads it and writes back the blocks it holds in the journal.
+origin = "/dev/sdb"
+
+# The journal. Keep this on fast storage (NVMe/SSD), as a plain file:
+#   fallocate -l 64G /var/lib/rcache/sdb.journal
+cache = "/var/lib/rcache/sdb.journal"
+
+# ublk device id. -1 (or omitted) picks a free one at start.
+id = 0
+
+[ublk]
+queues = 1
+depth = 64
+
+[write_back]
+# Start draining when the journal is 50% full and stop at 20%.
+high_pct = 50
+low_pct = 20
+# Above 90% writers wait for the drain instead of draining inline.
+max_pct = 90
+# 64 blocks = 256 KiB per step. Small steps keep the queue responsive on a
+# slow origin; a step is additionally capped at ~20 ms of work.
+step_blocks = 64
+# A journal that has not changed for this long is drained while idle.
+idle_secs = 5
+
+[metrics]
+# Prometheus scrape target: http://<host>:9101/metrics
+listen = "127.0.0.1:9101"

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the build reproducible across runners.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: build and test (${{ matrix.rust.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          # The MSRV must be actually exercised, not just declared.
+          - name: msrv
+            toolchain: "1.85.0"
+          - name: stable
+            toolchain: stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust.toolchain }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust.toolchain }}
+
+      - name: Format
+        if: matrix.rust.name == 'stable'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release
+
+  # The kernel-facing parts cannot be exercised on a shared runner (they need
+  # ublk_drv and root), so at least prove the binary starts and reports its
+  # usage instead of failing to link.
+  smoke:
+    name: binary smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Usage message
+        run: |
+          set +e
+          out=$(./target/release/rcache 2>&1)
+          code=$?
+          # No arguments means usage on stderr and exit code 2.
+          test "$code" -eq 2 || { echo "unexpected exit $code"; exit 1; }
+          echo "$out" | grep -q "rcache run" || { echo "usage missing"; exit 1; }
+      - name: Status without a device reports cleanly
+        run: |
+          set +e
+          out=$(./target/release/rcache status --id 99 2>&1)
+          test $? -ne 0 || { echo "expected failure for a missing device"; exit 1; }
+      - name: Config parsing is validated
+        run: |
+          printf 'origin = "/dev/x"\ncache = "/tmp/y"\n' > /tmp/ok.toml
+          ./target/release/rcache run --config /tmp/ok.toml --help >/dev/null 2>&1 || true
+          printf '[write_back]\nlow_pct = 80\nhigh_pct = 50\n' > /tmp/bad.toml
+          set +e
+          ./target/release/rcache run --config /tmp/bad.toml 2>&1 | grep -qi "low_pct" \
+            || { echo "invalid config was not rejected"; exit 1; }

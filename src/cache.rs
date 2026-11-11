@@ -13,11 +13,21 @@
 //! * The index is rebuilt on every start by scanning the ring, so there is no
 //!   independent index to keep consistent: the journal *is* the metadata.
 
-use anyhow::Context;
 use crate::log::{Log, BLOCK};
+use anyhow::Context;
 use std::collections::hash_map::Entry;
-use std::os::unix::fs::FileTypeExt;
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::FileTypeExt;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use crate::stats::Stats;
+
+/// Origin blocks that may be reclaimed from the journal before the origin is
+/// forced to disk. Bounds what a power loss can lose to roughly
+/// `MAX_UNSYNCED_BLOCKS * BLOCK` bytes, while keeping `fsync` off the hot path
+/// (it is a synchronous COMMIT on network filesystems).
+pub const MAX_UNSYNCED_BLOCKS: u64 = 8192;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -38,6 +48,10 @@ pub struct Cache {
     index: HashMap<u64, Live>,
     /// Origin blocks touched since the last flush, for diagnostics.
     dirty_blocks: u64,
+    /// Counters updated by the write-back path; `None` in unit tests.
+    stats: Option<Arc<Stats>>,
+    /// Origin blocks written since the last durable origin sync.
+    unsynced_blocks: u64,
 }
 
 /// Byte size of a block device (BLKGETSIZE64) or regular file.
@@ -73,6 +87,8 @@ impl Cache {
             file: origin_file,
             index: HashMap::new(),
             dirty_blocks: 0,
+            stats: None,
+            unsynced_blocks: 0,
         };
         c.replay()?;
         Ok(c)
@@ -112,6 +128,23 @@ impl Cache {
     /// Publish the journal header after a batch of appends.
     pub fn publish(&mut self) -> anyhow::Result<()> {
         self.log.deferred_header_write()
+    }
+
+    /// Attach counters so the write-back path reports into them.
+    pub fn with_stats(mut self, stats: Arc<Stats>) -> Cache {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Push everything written to the origin to stable storage.
+    ///
+    /// Write-back steps avoid this because it is expensive on network
+    /// filesystems; FLUSH and shutdown call it to honour their promise.
+    pub fn sync_origin(&mut self) -> anyhow::Result<()> {
+        self.file.sync_data()?;
+        self.dirty_blocks = 0;
+        self.unsynced_blocks = 0;
+        Ok(())
     }
 
     /// Make every accepted write durable in the journal.
@@ -222,6 +255,9 @@ impl Cache {
         // spin here.
         if !self.log.can_fit(buf.len() as u64) {
             log::debug!("journal full, draining to origin before append");
+            if let Some(st) = &self.stats {
+                st.journal_full_drains.fetch_add(1, Ordering::Relaxed);
+            }
             self.flush()?;
         }
         // No lookup by scanning: the record offset comes straight from append,
@@ -252,6 +288,9 @@ impl Cache {
     /// the data can still be recovered on the next start.
     pub fn flush(&mut self) -> anyhow::Result<()> {
         while self.write_back_step(usize::MAX)? > 0 {}
+        // The journal is about to be discarded, so the origin content must be
+        // on stable storage before that happens.
+        self.sync_origin()?;
         self.log.reset()?;
         self.index.clear();
         Ok(())
@@ -284,6 +323,20 @@ impl Cache {
     ///
     /// `cut` is chosen so that at most `budget` distinct blocks are written.
     pub fn write_back_step(&mut self, budget_blocks: usize) -> anyhow::Result<usize> {
+        self.write_back_step_within(budget_blocks, None)
+    }
+
+    /// Like [`Cache::write_back_step`], but stops early once `deadline` passes.
+    ///
+    /// The block budget alone does not bound the pause on a slow origin: one
+    /// step of 64 blocks can take seconds on a network filesystem, and the
+    /// whole time it holds the cache lock. Returning partial work is safe
+    /// because only the records actually written are reclaimed.
+    pub fn write_back_step_within(
+        &mut self,
+        budget_blocks: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<usize> {
         let recs = self.log.scan()?;
         if recs.is_empty() {
             return Ok(0);
@@ -324,7 +377,16 @@ impl Cache {
         // Forward-sequential on the origin.
         work.sort_unstable_by_key(|(blk, _, _)| *blk);
 
+        let superseded = prefix.len() - work.len();
+        let wb_started = std::time::Instant::now();
+        let mut bytes_written = 0u64;
+        let mut done_blocks = 0usize;
         for (blk, pos, _version) in &work {
+            if let Some(dl) = deadline {
+                if std::time::Instant::now() >= dl {
+                    break;
+                }
+            }
             let Some((h, data)) = self.log.read_record(*pos)? else {
                 continue;
             };
@@ -332,14 +394,48 @@ impl Cache {
                 continue;
             }
             if let Err(e) = self.file.write_all_at(&data, blk * BLOCK) {
+                if let Some(st) = &self.stats {
+                    st.write_back_errors.fetch_add(1, Ordering::Relaxed);
+                }
                 anyhow::bail!(
                     "origin write of block {blk} failed ({} records kept): {e}",
                     recs.len()
                 );
             }
+            bytes_written += data.len() as u64;
+            done_blocks += 1;
         }
-        self.file.sync_data()?;
-        self.dirty_blocks = self.dirty_blocks.saturating_add(work.len() as u64);
+        if done_blocks == 0 {
+            return Ok(0);
+        }
+        // Do NOT fsync the origin here. On a network filesystem every sync is
+        // a synchronous COMMIT RPC, which costs far more than the writes it
+        // covers; doing one per step throttles the whole cache. The data is in
+        // the page cache (and the journal still holds it), so reclaiming a
+        // little later is safe -- see `origin_is_synced`.
+        self.dirty_blocks = self.dirty_blocks.saturating_add(done_blocks as u64);
+        self.unsynced_blocks += done_blocks as u64;
+
+        // Reclaiming a record discards the journal's copy, so the origin write
+        // must be durable first. Syncing on every step is far too expensive on
+        // a network filesystem, so allow a bounded window: the newest
+        // `MAX_UNSYNCED_BLOCKS` blocks may live only in the page cache.
+        if self.unsynced_blocks >= MAX_UNSYNCED_BLOCKS {
+            self.file.sync_data()?;
+            self.unsynced_blocks = 0;
+        }
+
+        if let Some(st) = &self.stats {
+            st.write_back_blocks
+                .fetch_add(done_blocks as u64, Ordering::Relaxed);
+            st.write_back_records
+                .fetch_add(prefix.len() as u64, Ordering::Relaxed);
+            st.write_back_superseded
+                .fetch_add(superseded as u64, Ordering::Relaxed);
+            st.write_back_bytes
+                .fetch_add(bytes_written, Ordering::Relaxed);
+            st.write_back_latency.observe(wb_started.elapsed());
+        }
 
         // Reclaim exactly the records we handled.
         self.log.reclaim_records(prefix.len())?;
@@ -397,22 +493,15 @@ mod tests {
 
     impl Fx {
         fn new(name: &str) -> Fx {
-            let dir = std::env::temp_dir().join(format!(
-                "rcache-cache-{}-{}",
-                std::process::id(),
-                name
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("rcache-cache-{}-{}", std::process::id(), name));
             std::fs::create_dir_all(&dir).unwrap();
             // 8 MiB origin: enough blocks for the index/replay tests.
             let origin = dir.join("origin.img");
             let f = std::fs::File::create(&origin).unwrap();
             f.set_len(8 << 20).unwrap();
             let cache = dir.join("cache.img");
-            Fx {
-                dir,
-                origin,
-                cache,
-            }
+            Fx { dir, origin, cache }
         }
     }
 
@@ -453,7 +542,8 @@ mod tests {
         let fx = Fx::new("miss");
         // Pre-fill origin block 7.
         let f = File::options().write(true).open(&fx.origin).unwrap();
-        f.write_all_at(&[0x11u8; BLOCK as usize], 7 * BLOCK).unwrap();
+        f.write_all_at(&[0x11u8; BLOCK as usize], 7 * BLOCK)
+            .unwrap();
         drop(f);
 
         let c = Cache::open(&fx.cache, &fx.origin).unwrap();
@@ -666,7 +756,10 @@ mod tests {
             .unwrap()
             .read_exact_at(&mut buf, 5 * BLOCK)
             .unwrap();
-        assert!(buf.iter().all(|&b| b == 0x99), "block 5 lost its newest version");
+        assert!(
+            buf.iter().all(|&b| b == 0x99),
+            "block 5 lost its newest version"
+        );
     }
 
     /// `scan()` only sees a contiguous run from the head. The append path can
@@ -685,7 +778,8 @@ mod tests {
         let fits = ring / per;
 
         for round in 0..(fits * 3) {
-            c.write_block(round % 50, &[round as u8; BLOCK as usize]).unwrap();
+            c.write_block(round % 50, &[round as u8; BLOCK as usize])
+                .unwrap();
             if round % 2 == 0 {
                 c.write_back_step(2).unwrap();
             }
@@ -741,7 +835,8 @@ mod tests {
         // Fewer than BATCH_APPENDS so nothing is fsynced yet.
         let n = (crate::log::BATCH_APPENDS as usize) - 1;
         for i in 0..n {
-            c.write_block(i as u64, &[(i as u8) | 1; BLOCK as usize]).unwrap();
+            c.write_block(i as u64, &[(i as u8) | 1; BLOCK as usize])
+                .unwrap();
         }
         assert!(c.pending_appends() > 0, "expected an unsynced batch");
         assert_eq!(c.index_len(), n);
@@ -778,6 +873,58 @@ mod tests {
         assert!(read_origin(&fx, 0).iter().all(|&b| b == 0));
         c.flush().unwrap();
         assert!(read_origin(&fx, 0).iter().all(|&b| b == 0x77));
+    }
+
+    /// A step given an already-expired deadline must do nothing, and a
+    /// partial step must only reclaim what it actually wrote back.
+    #[test]
+    fn step_respects_deadline() {
+        let fx = Fx::new("deadline");
+        let mut c = Cache::open(&fx.cache, &fx.origin).unwrap();
+        for i in 0..8u64 {
+            c.write_block(i, &[0x33; BLOCK as usize]).unwrap();
+        }
+        let live_before = c.index_len();
+        // Deadline already passed: no work, no reclaim.
+        let past = std::time::Instant::now();
+        let done = c.write_back_step_within(64, Some(past)).unwrap();
+        assert_eq!(done, 0, "expired deadline still wrote back");
+        assert_eq!(
+            c.index_len(),
+            live_before,
+            "expired deadline reclaimed records"
+        );
+
+        // A generous deadline does the work.
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let done = c.write_back_step_within(64, Some(later)).unwrap();
+        assert_eq!(done, 8);
+        for i in 0..8u64 {
+            assert_eq!(read_origin(&fx, i)[0], 0x33, "block {i} not written");
+        }
+    }
+
+    /// The origin must hold every block before the journal is reset, or a
+    /// crash right after `flush()` would lose data that was acknowledged.
+    #[test]
+    fn flush_keeps_origin_complete() {
+        let fx = Fx::new("flushorder");
+        let mut c = Cache::open(&fx.cache, &fx.origin).unwrap();
+        let n = 32u64;
+        for i in 0..n {
+            c.write_block(i, &[(i as u8) + 1; BLOCK as usize]).unwrap();
+        }
+        assert_eq!(c.index_len() as u64, n);
+        c.flush().unwrap();
+        assert_eq!(c.index_len(), 0, "journal still holds blocks after flush");
+        assert_eq!(c.log.used(), 0);
+        for i in 0..n {
+            assert_eq!(read_origin(&fx, i)[0], (i as u8) + 1, "block {i} missing");
+        }
+        // And the ring still accepts new writes afterwards.
+        c.write_block(100, &[0xEE; BLOCK as usize]).unwrap();
+        c.flush().unwrap();
+        assert_eq!(read_origin(&fx, 100)[0], 0xEE);
     }
 
     #[test]

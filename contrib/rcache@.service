@@ -1,0 +1,45 @@
+# rcache device instance, templated by ublk id or by config name.
+#
+# Install with `make install`, then:
+#
+#   systemctl enable --now rcache@0.service
+#
+# The unit name selects the configuration file: rcache@0 reads
+# /etc/rcache/0.toml. Keeping one file per instance means several devices can
+# run side by side without sharing state.
+#
+# The cache journal lives on fast storage; the origin device must be present
+# before we start, so ordering is declared below.
+
+[Unit]
+Description=rcache write-back cache (instance %i)
+Documentation=https://github.com/myml/rcache
+After=local-fs.target remote-fs.target systemd-modules-load.service
+Wants=systemd-modules-load.service
+# Never stop in the middle of a write-back: the origin must stay complete.
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/install -d -m 0755 /run/rcache
+ExecStart=/usr/sbin/rcache run --config /etc/rcache/%i.toml
+# rcache drains the journal on SIGTERM but keeps serving a mounted filesystem,
+# so give it room; the real teardown is `rcache stop`.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+
+# Hardening: rcache needs raw block device access and ublk, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/rcache
+ReadOnlyPaths=/etc/rcache
+DeviceAllow=/dev/ublk-control rw
+DeviceAllow=/dev/ublkb* rw
+
+[Install]
+WantedBy=multi-user.target

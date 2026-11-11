@@ -1,0 +1,17 @@
+[package]
+name = "rcache"
+version = "0.1.0"
+edition = "2021"
+# Debian trixie ships 1.85; keep the tree buildable with it.
+rust-version = "1.85"
+description = "Write-back block cache: a slow origin disk plus a journal kept in a file on fast storage, exposed as a ublk device"
+license = "Apache-2.0"
+repository = "https://github.com/myml/rcache"
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+libublk = "0.4"
+crc32fast = "1"
+libc = "0.2"

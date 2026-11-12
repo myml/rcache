@@ -69,7 +69,8 @@ mod slot {
     // Latency histograms: (count, sum_us, max_us) then bucket counts.
     pub const LAT_BASE: usize = 32;
     pub const LAT_STRIDE: usize = 4 + crate::stats::LATENCY_EDGES_US.len() + 1;
-    pub const N_LAT: usize = 4;
+    /// read, write, flush, write_back, lock_wait, lock_hold.
+    pub const N_LAT: usize = 6;
     pub const TOTAL: usize = LAT_BASE + LAT_STRIDE * N_LAT;
 }
 
@@ -241,6 +242,8 @@ impl SharedStats {
             snap.write_latency,
             snap.flush_latency,
             snap.write_back_latency,
+            snap.lock_wait,
+            snap.lock_hold,
         ]
         .iter()
         .enumerate()
@@ -349,6 +352,8 @@ pub fn read_status(id: i32) -> anyhow::Result<Option<Status>> {
             space_waits: r(slot::SPACE_WAITS),
             journal_full_drains: r(slot::JOURNAL_FULL_DRAINS),
             cache_bytes_written: r(slot::CACHE_BYTES_WRITTEN),
+            lock_wait: read_hist(4),
+            lock_hold: read_hist(5),
             read_latency: read_hist(0),
             write_latency: read_hist(1),
             flush_latency: read_hist(2),

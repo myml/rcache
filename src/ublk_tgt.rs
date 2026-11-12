@@ -87,6 +87,41 @@ impl Shared {
     }
 }
 
+/// Wraps a cache guard so the wait for the lock and the time spent holding it
+/// are both recorded. Knowing which of the two dominates decides whether the
+/// right fix is sharding the lock or shortening a critical section.
+struct TimedGuard<'a> {
+    guard: Option<MutexGuard<'a, Cache>>,
+    stats: &'a Stats,
+    acquired: std::time::Instant,
+}
+
+impl TimedGuard<'_> {
+    fn get(&mut self) -> &mut Cache {
+        self.guard.as_mut().expect("guard taken before drop")
+    }
+}
+
+impl Drop for TimedGuard<'_> {
+    fn drop(&mut self) {
+        self.stats.lock_hold.observe(self.acquired.elapsed());
+        // Dropping the guard releases the lock right after this.
+        self.guard.take();
+    }
+}
+
+fn lock_timed<'a>(cache: &'a Mutex<Cache>, stats: &'a Stats) -> TimedGuard<'a> {
+    let t0 = std::time::Instant::now();
+    let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let acquired = std::time::Instant::now();
+    stats.lock_wait.observe(acquired - t0);
+    TimedGuard {
+        guard: Some(guard),
+        stats,
+        acquired,
+    }
+}
+
 /// Signals a writer that is waiting for journal space.
 type SpaceSignal = (Mutex<bool>, std::sync::Condvar);
 
@@ -577,7 +612,7 @@ pub fn process_op_shared(
     buf: &mut [u8],
 ) -> i32 {
     use std::sync::atomic::Ordering::Relaxed;
-    let lock = || cache.lock().unwrap_or_else(|p| p.into_inner());
+    let lock = || lock_timed(cache, stats);
     let (blk, nblocks) = byte_range(sector, bytes);
     let aligned = is_aligned(sector, BLOCK) && is_aligned(bytes as u64, BLOCK);
     let started = std::time::Instant::now();
@@ -585,13 +620,13 @@ pub fn process_op_shared(
     match op {
         libublk::sys::UBLK_IO_OP_READ => {
             let hits = {
-                let c = lock();
+                let mut c = lock();
                 (0..nblocks)
-                    .filter(|i| c.is_cached(blk + *i as u64))
+                    .filter(|i| c.get().is_cached(blk + *i as u64))
                     .count()
             };
             let res = if aligned {
-                match lock().read(blk, nblocks, buf) {
+                match lock().get().read(blk, nblocks, buf) {
                     Ok(()) => bytes as i32,
                     Err(e) => {
                         log::error!("read at sector {sector}: {e}");
@@ -602,7 +637,7 @@ pub fn process_op_shared(
                 // Sub-block read: fetch the covering blocks, copy the slice.
                 let off = (sector % BLOCK) as usize;
                 match read_slice(
-                    &mut lock(),
+                    lock().get(),
                     blk,
                     nblocks.min(bytes / BLOCK as usize + 1),
                     off,
@@ -636,7 +671,7 @@ pub fn process_op_shared(
                 }
             }
             let res = if aligned {
-                match lock().write(blk, nblocks, buf) {
+                match lock().get().write(blk, nblocks, buf) {
                     Ok(()) => bytes as i32,
                     Err(e) => {
                         log::error!("write at sector {sector}: {e}");
@@ -645,7 +680,7 @@ pub fn process_op_shared(
                 }
             } else {
                 // Sub-block write: read-modify-write the covering blocks.
-                match write_slice(&mut lock(), blk, nblocks, sector, &buf[..bytes]) {
+                match write_slice(lock().get(), blk, nblocks, sector, &buf[..bytes]) {
                     Ok(()) => bytes as i32,
                     Err(e) => {
                         log::error!("unaligned write at sector {sector}: {e}");
@@ -665,9 +700,11 @@ pub fn process_op_shared(
         }
         libublk::sys::UBLK_IO_OP_FLUSH => {
             // Everything accepted so far must be on stable storage before the
-            // flush reports success.
+            // flush reports success. Syncing the journal is enough for that;
+            // draining to the origin here would hold the lock for as long as
+            // the slow disk needs (see `Cache::sync_journal`).
             let mut c = lock();
-            let res = match c.sync().and_then(|()| c.flush()) {
+            let res = match c.get().sync_journal() {
                 Ok(()) => 0,
                 Err(e) => {
                     log::error!("flush: {e}");
@@ -682,7 +719,7 @@ pub fn process_op_shared(
             res
         }
         libublk::sys::UBLK_IO_OP_DISCARD => {
-            let res = match lock().discard(blk, nblocks) {
+            let res = match lock().get().discard(blk, nblocks) {
                 Ok(()) => 0,
                 Err(e) => {
                     log::error!("discard at sector {sector}: {e}");
@@ -958,11 +995,34 @@ mod tests {
         );
         assert!(zero.iter().all(|&b| b == 0));
 
-        // 4. FLUSH drains the journal to the origin.
+        // 4. FLUSH makes the journal durable but does not drain it: the data
+        //    is safe once the journal is synced, and draining here would hold
+        //    the lock for as long as the origin takes.
         assert_eq!(
             process_op(&cache, libublk::sys::UBLK_IO_OP_FLUSH, 0, 0, &mut []),
             0
         );
+        assert_eq!(cache.lock().unwrap().pending_appends(), 0);
+        assert_eq!(
+            cache.lock().unwrap().index_len(),
+            3,
+            "FLUSH must keep the journal contents"
+        );
+        // The data is still served correctly from the journal.
+        let mut again = vec![0u8; buf.len()];
+        assert_eq!(
+            process_op(
+                &cache,
+                libublk::sys::UBLK_IO_OP_READ,
+                100 * BLOCK,
+                buf.len(),
+                &mut again
+            ),
+            buf.len() as i32
+        );
+        assert_eq!(again, buf);
+        // A full drain (what shutdown does) does reach the origin.
+        cache.lock().unwrap().flush().unwrap();
         for i in 0..3u64 {
             let ob = origin_block(&origin, 100 + i);
             let off = i as usize * BLOCK as usize;
@@ -1037,12 +1097,27 @@ mod tests {
         assert!(rest[512..1024].iter().all(|&b| b == 0x5C));
         assert!(rest[1024..].iter().all(|&b| b == 0xAA));
 
-        // Flush and verify the origin got the merged block.
-        assert_eq!(
-            process_op(&cache, libublk::sys::UBLK_IO_OP_FLUSH, 0, 0, &mut []),
-            0
-        );
+        // The merged block must be readable through the cache right away: a
+        // sub-block write is a read-modify-write, so the untouched bytes keep
+        // their old value. FLUSH only makes the journal durable, so read back
+        // through the device rather than from the origin.
         let mut o = vec![0u8; BLOCK as usize];
+        assert_eq!(
+            process_op(
+                &cache,
+                libublk::sys::UBLK_IO_OP_READ,
+                BLOCK,
+                o.len(),
+                &mut o
+            ),
+            BLOCK as i32
+        );
+        assert_eq!(o[512], 0x5C, "the written byte is missing");
+        assert_eq!(o[0], 0xAA, "bytes before the patch were lost");
+        assert_eq!(o[2048], 0xAA, "bytes after the patch were lost");
+
+        // Draining reaches the origin with the same merged content.
+        cache.lock().unwrap().flush().unwrap();
         {
             use std::os::unix::fs::FileExt;
             std::fs::File::open(&origin)

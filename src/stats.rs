@@ -138,6 +138,13 @@ pub struct Stats {
     /// Bytes read from / written to the cache file.
     pub cache_bytes_written: AtomicU64,
 
+    /// Time spent actually holding the cache mutex (as opposed to total
+    /// request time). The gap between this and write_latency is the time a
+    /// request spent waiting for the lock.
+    pub lock_hold: Histogram,
+    /// Time a request spent waiting to acquire the lock.
+    pub lock_wait: Histogram,
+
     pub read_latency: Histogram,
     pub write_latency: Histogram,
     pub flush_latency: Histogram,
@@ -170,6 +177,8 @@ impl Stats {
             space_waits: AtomicU64::new(0),
             journal_full_drains: AtomicU64::new(0),
             cache_bytes_written: AtomicU64::new(0),
+            lock_hold: Histogram::new(),
+            lock_wait: Histogram::new(),
             read_latency: Histogram::new(),
             write_latency: Histogram::new(),
             flush_latency: Histogram::new(),
@@ -203,6 +212,8 @@ impl Stats {
             space_waits: self.space_waits.load(Ordering::Relaxed),
             journal_full_drains: self.journal_full_drains.load(Ordering::Relaxed),
             cache_bytes_written: self.cache_bytes_written.load(Ordering::Relaxed),
+            lock_hold: self.lock_hold.snapshot(),
+            lock_wait: self.lock_wait.snapshot(),
             read_latency: self.read_latency.snapshot(),
             write_latency: self.write_latency.snapshot(),
             flush_latency: self.flush_latency.snapshot(),
@@ -231,6 +242,8 @@ pub struct StatsSnapshot {
     pub space_waits: u64,
     pub journal_full_drains: u64,
     pub cache_bytes_written: u64,
+    pub lock_hold: HistogramSnapshot,
+    pub lock_wait: HistogramSnapshot,
     pub read_latency: HistogramSnapshot,
     pub write_latency: HistogramSnapshot,
     pub flush_latency: HistogramSnapshot,

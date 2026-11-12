@@ -172,6 +172,28 @@ pub fn render_text(s: &Status) -> String {
             h.mean_us()
         );
     }
+    // Lock contention: when the wait dominates the hold the bottleneck is
+    // contention (shard the lock or use async IO); when the hold dominates it
+    // is a long critical section (do less under the lock).
+    if st.lock_wait.count > 0 {
+        let _ = writeln!(o);
+        let _ = writeln!(
+            o,
+            "lock (us)         p50      p90      p99      max     mean"
+        );
+        for (name, h) in [("wait", &st.lock_wait), ("hold", &st.lock_hold)] {
+            let _ = writeln!(
+                o,
+                "{:<16} {:>7}  {:>7}  {:>7}  {:>7}  {:>7.0}",
+                name,
+                h.quantile_us(0.50),
+                h.quantile_us(0.90),
+                h.quantile_us(0.99),
+                h.max_us,
+                h.mean_us()
+            );
+        }
+    }
     let _ = writeln!(o);
     let _ = writeln!(
         o,

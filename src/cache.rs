@@ -27,7 +27,7 @@ use crate::stats::Stats;
 /// forced to disk. Bounds what a power loss can lose to roughly
 /// `MAX_UNSYNCED_BLOCKS * BLOCK` bytes, while keeping `fsync` off the hot path
 /// (it is a synchronous COMMIT on network filesystems).
-pub const MAX_UNSYNCED_BLOCKS: u64 = 8192;
+pub const MAX_UNSYNCED_BLOCKS: u64 = 32768;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -134,6 +134,17 @@ impl Cache {
     pub fn with_stats(mut self, stats: Arc<Stats>) -> Cache {
         self.stats = Some(stats);
         self
+    }
+
+    /// Make every accepted write durable, without moving data to the origin.
+    ///
+    /// This is what a FLUSH from the filesystem needs: once the journal is on
+    /// stable storage the write is safe (a crash replays it). Draining to the
+    /// origin here would block the queue for as long as the slow disk takes --
+    /// measured at up to 9 seconds on a network filesystem -- and the data
+    /// would be no safer than when it sits in a synced journal.
+    pub fn sync_journal(&mut self) -> anyhow::Result<()> {
+        self.log.flush_header()
     }
 
     /// Push everything written to the origin to stable storage.
@@ -421,6 +432,12 @@ impl Cache {
         // a network filesystem, so allow a bounded window: the newest
         // `MAX_UNSYNCED_BLOCKS` blocks may live only in the page cache.
         if self.unsynced_blocks >= MAX_UNSYNCED_BLOCKS {
+            // This fsync sits inside the critical section, so its cost is a
+            // direct latency hit for every writer. On a network filesystem it
+            // is a synchronous COMMIT that can take tens of milliseconds, so
+            // the window is kept large (128 MiB) on purpose. The journal still
+            // holds those records until they are reclaimed *after* this, so
+            // the exposure is bounded either way.
             self.file.sync_data()?;
             self.unsynced_blocks = 0;
         }
